@@ -1,0 +1,54 @@
+# ==============================================================================
+# 스마트 도로 주행 미션 - PC 시뮬레이션 및 AI 개발용 Dockerfile
+# 베이스 이미지: Ubuntu 24.04 기반 ROS 2 Jazzy Desktop Full
+# ==============================================================================
+FROM osrf/ros:jazzy-desktop-full
+
+# 터미널 입력 창 뜨는 것 방지 및 한글 깨짐 방지 설정
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+SHELL ["/bin/bash", "-c"]
+
+# 1. 시스템 필수 패키지 및 개발 툴 설치
+RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-colcon-common-extensions \
+    git \
+    tmux \
+    wget \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. ROS 2 Jazzy용 가제보(Gazebo Harmonic) 심-브릿지 및 센서 메시지 설치
+# 중간 퀴즈: Jazzy 버전부터는 기존 Gazebo Classic이 아닌 뉴 가제보(Gz)를 사용하므로 ros-gz 패키지가 필수입니다.
+RUN apt-get update && apt-get install -y \
+    ros-jazzy-ros-gz \
+    ros-jazzy-geometry-msgs \
+    ros-jazzy-sensor-msgs \
+    ros-jazzy-image-transport \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. 딥러닝(YOLOv8) 및 그래픽/비전 라이브러리 설치
+# Ubuntu 24.04의 pip 제한을 우회하기 위해 --break-system-packages 옵션을 사용합니다.
+RUN pip3 install --no-cache-dir --break-system-packages \
+    ultralytics \
+    opencv-python \
+    numpy \
+    matplotlib
+
+# 4. 엔비디아(NVIDIA) 그래픽 가속을 위한 환경 변수 세팅 (외장 그래픽 유저용)
+ENV NVIDIA_VISIBLE_DEVICES \
+    ${NVIDIA_VISIBLE_DEVICES:-all}
+ENV NVIDIA_DRIVER_CAPABILITIES \
+    ${NVIDIA_DRIVER_CAPABILITIES:+$NVIDIA_DRIVER_CAPABILITIES,}graphics
+
+# 5. ROS 2 작업 공간(Workspace) 및 진입점 설정
+WORKDIR /ros2_ws
+
+# 컨테이너 접속 시 ROS 2 환경 자동으로 불러오기
+RUN echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc \
+    && echo "source /ros2_ws/install/setup.bash" >> ~/.bashrc
+
+CMD ["bash"]
