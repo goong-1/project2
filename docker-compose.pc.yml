@@ -15,7 +15,7 @@ services:
       - QT_X11_NO_MITSHM=1
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw # GUI 통신용 소켓 공유
-      - .:/ros2_ws/src/smart_road_robot # 현재 폴더의 소스코드를 도커 내부 공간과 실시간 동기화
+      - .:/ros2_ws/src/projact2 # 현재 폴더의 소스코드를 도커 내부 공간과 실시간 동기화
     stdin_open: true
     tty: true
 
