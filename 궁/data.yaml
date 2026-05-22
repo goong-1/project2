@@ -1,0 +1,13 @@
+path: .
+
+train: train/images
+val: valid/images
+
+nc: 6
+names:
+  - greenlight
+  - redlight
+  - traffic_light
+  - traffic_light_green
+  - traffic_light_red
+  - yellowlight
