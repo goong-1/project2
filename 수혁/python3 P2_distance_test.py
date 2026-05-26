@@ -15,7 +15,7 @@ try:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(2.0)
     sock.connect((ESP32_IP, PORT))
-    print(f"[{ESP32_IP}:{PORT}] 소켓 통신 시스템 활성화 성공!")
+    print(f"[{ESP32_IP}:{PORT}] 센서 퓨전 시스템 활성화 성공!")
     sock.settimeout(None)
 except Exception as e:
     print(f"ESP32 접속 에러. IP 주소를 확인하세요.\n상세: {e}")
@@ -24,7 +24,7 @@ except Exception as e:
 active_command = 'x'
 running = True
 
-# 1. 수신 스레드 (엔코더 실시간 갱신 및 스크롤 출력)
+# 1. 수신 스레드
 def read_from_socket():
     global running
     while running:
@@ -34,7 +34,8 @@ def read_from_socket():
                 lines = data.split('\n')
                 for line in lines:
                     if line.strip():
-                        sys.stdout.write(f"\r[로봇 실시간 상태] {line.strip()}\n")
+                        # 화면 깜빡임 방지를 위해 캐리지 리턴(\r) 사용
+                        sys.stdout.write(f"\r[로봇 실시간 상태] {line.strip()}                    \n")
                         sys.stdout.flush()
             else:
                 raise Exception("서버 점검 또는 연결 끊김.")
@@ -63,7 +64,7 @@ heartbeat_thread = threading.Thread(target=send_heartbeat)
 heartbeat_thread.daemon = True
 heartbeat_thread.start()
 
-# 3. 터미널 ECHO 및 버퍼 비활성화 제어
+# 3. 터미널 제어
 def get_char():
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -76,12 +77,12 @@ def get_char():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     return ch
 
-print("\n" + "="*40)
-print(" 🚀 [363cm 자율 주행 모드] 통제 단말기 (WSL)")
-print(" - [g] : 363cm 목표 주행 출발")
+print("\n" + "="*50)
+print(" 🚀 [IMU 헤딩 홀드 + 363cm 자율 주행] 통제 단말기")
+print(" - [g] : 출발 (출발 순간의 각도를 유지하며 직진)")
 print(" - [x] : 긴급 정지 (E-STOP)")
 print(" - [q] : 프로그램 종료")
-print("="*40 + "\n")
+print("="*50 + "\n")
 
 try:
     while running:
