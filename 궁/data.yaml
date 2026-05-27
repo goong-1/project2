@@ -1,13 +1,15 @@
-path: .
-
+path: /home/shin/ros2_ws/src/tracking_system/yolo/datasets
 train: train/images
 val: valid/images
 
-nc: 6
+nc: 9
 names:
-  - greenlight
-  - redlight
-  - traffic_light
-  - traffic_light_green
-  - traffic_light_red
-  - yellowlight
+  0: greenlight
+  1: light_off
+  2: limit_sign
+  3: obstacle
+  4: other_sign
+  5: redlight
+  6: stop_sign
+  7: traffic_left_light_green
+  8: traffic_light_red
