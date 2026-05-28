@@ -12,3 +12,7 @@ upper = np.array([12, 255, 255])
 검은색 - 밝은 검은색도 잡힘
 lower = np.array([0, 0, 0])
 upper = np.array([180, 255, 102])
+
+흰색 - 밝은 조명이 검은선에 반사된다면 잡힘
+lower = np.array([0, 0, 185])
+upper = np.array([180, 18, 255])
