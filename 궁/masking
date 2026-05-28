@@ -1,0 +1,14 @@
+현재 HSV 범위
+
+노란색 - 잘잡힘
+lower = np.array([25, 83, 95])
+upper = np.array([41, 255, 255])
+
+빨간색 - 전반적으로 노이즈 있음
+lower = np.array([0, 32, 49])
+upper = np.array([12, 255, 255])
+
+
+검은색 - 밝은 검은색도 잡힘
+lower = np.array([0, 0, 0])
+upper = np.array([180, 255, 102])
