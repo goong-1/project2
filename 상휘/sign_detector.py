@@ -29,25 +29,26 @@ class TrafficSignDetector:
 
         self.action_map = {
             "greenlight": "GO",
-            "traffic_left_light_green": "GO",
+            "traffic_left_light_green": "TURN_LEFT",
 
             "redlight": "STOP",
             "traffic_light_red": "STOP",
             "stop_sign": "STOP",
 
-            "yellowlight": "SLOW",
+            #"yellowlight": "SLOW",
             "limit_sign": "SPEED_LIMIT",
 
-            "light_off": "IGNORE",
+            #"light_off": "IGNORE",
         }
 
         self.color_map = {
             "STOP": (0, 0, 255),         # red
             "GO": (0, 255, 0),           # green
-            "SLOW": (0, 255, 255),       # yellow
+            #"SLOW": (0, 255, 255),       # yellow
             "SPEED_LIMIT": (255, 0, 0),  # blue
-            "IGNORE": (160, 160, 160),   # gray
+            #"IGNORE": (160, 160, 160),   # gray
             "UNKNOWN": (255, 255, 255),  # white
+            "TURN_LEFT": (255, 255, 0),   # cyan
         }
 
     def detect_all(self, frame):
@@ -72,6 +73,19 @@ class TrafficSignDetector:
             cls_id = int(box.cls[0])
             confidence = float(box.conf[0])
             label = self.model.names[cls_id]
+            
+            allowed_labels = {
+                "greenlight",
+                "traffic_left_light_green",
+                "redlight",
+                "traffic_light_red",
+                "stop_sign",
+                "limit_sign",
+            }
+            if label not in allowed_labels:
+                continue
+
+
 
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
@@ -83,7 +97,7 @@ class TrafficSignDetector:
                 detected=True,
                 label=label,
                 confidence=confidence,
-                action_hint=self.action_map.get(label, "UNKNOWN"),
+                action_hint=self.action_map.get(label, "GO"),
                 bbox={
                     "x1": x1,
                     "y1": y1,
@@ -136,21 +150,36 @@ class TrafficSignDetector:
                 "detected": False,
                 "label": None,
                 "confidence": 0.0,
-                "action_hint": "NONE",
+                "action_hint": "GO",
             }
 
         # STOP 계열을 우선순위로 둘 수도 있음
         priority = {
             "STOP": 3,
-            "SLOW": 2,
-            "SPEED_LIMIT": 1,
-            "GO": 1,
-            "IGNORE": 0,
-            "UNKNOWN": 0,
+            "SPEED_LIMIT": 2,
+            "TURN_LEFT": 1,
+            "GO": 0,
+            #"IGNORE": 0,
+            #"UNKNOWN": 0,
         }
+        
+        valid_actions = {"STOP", "GO", "SPEED_LIMIT", "TURN_LEFT"}
 
+        valid_detections = [
+            d for d in detections
+            if d.action_hint in valid_actions
+        ]
+
+        if not valid_detections:
+            return {
+                "detected": False,
+                "label": None,
+                "confidence": 0.0,
+                "action_hint": "GO",
+            }
+            
         best = max(
-            detections,
+            valid_detections,
             key=lambda d: (priority.get(d.action_hint, 0), d.confidence)
         )
 
