@@ -1,3 +1,9 @@
+// dds 환경변수 미리 설정
+echo 'export ROS_DOMAIN_ID=0' >> ~/.bashrc
+echo 'export RMW_IMPLEMENTATION=rmw_fastrtps_cpp' >> ~/.bashrc
+source ~/.bashrc
+
+
 cat > ~/fastdds_unicast.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8" ?>
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
@@ -18,3 +24,4 @@ EOF
 
 echo 'export FASTRTPS_DEFAULT_PROFILES_FILE=~/fastdds_unicast.xml' >> ~/.bashrc
 source ~/.bashrc
+
