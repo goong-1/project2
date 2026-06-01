@@ -1,0 +1,20 @@
+cat > ~/fastdds_unicast.xml << 'EOF'
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="unicast" is_default_profile="true">
+    <rtps>
+      <builtin>
+        <metatrafficUnicastLocatorList>
+          <locator><udpv4><address>0.0.0.0</address></udpv4></locator>
+        </metatrafficUnicastLocatorList>
+        <initialPeersList>
+          <locator><udpv4><address>192.168.x.x</address></udpv4></locator>
+        </initialPeersList>
+      </builtin>
+    </rtps>
+  </participant>
+</profiles>
+EOF
+
+echo 'export FASTRTPS_DEFAULT_PROFILES_FILE=~/fastdds_unicast.xml' >> ~/.bashrc
+source ~/.bashrc
