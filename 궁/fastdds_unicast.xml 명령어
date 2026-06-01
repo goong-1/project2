@@ -4,6 +4,7 @@ echo 'export RMW_IMPLEMENTATION=rmw_fastrtps_cpp' >> ~/.bashrc
 source ~/.bashrc
 
 
+WSL2면 XML 추가 (라즈베리파이 IP 넣어서)
 cat > ~/fastdds_unicast.xml << 'EOF'
 <?xml version="1.0" encoding="UTF-8" ?>
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
