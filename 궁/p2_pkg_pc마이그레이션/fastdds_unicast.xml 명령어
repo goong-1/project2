@@ -15,7 +15,7 @@ cat > ~/fastdds_unicast.xml << 'EOF'
           <locator><udpv4><address>0.0.0.0</address></udpv4></locator>
         </metatrafficUnicastLocatorList>
         <initialPeersList>
-          <locator><udpv4><address>192.168.x.x</address></udpv4></locator>
+          <locator><udpv4><address>192.168.0.23</address></udpv4></locator>
         </initialPeersList>
       </builtin>
     </rtps>
