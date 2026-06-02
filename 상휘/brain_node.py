@@ -15,7 +15,7 @@ class ControlHandler(Node):
         # 비전 창 업데이트용 상태 퍼블리셔
         self.state_pub = self.create_publisher(String, '/control_state', 10)
 
-        # 원본 제어 FSM 변수 완벽 이식
+        # FSM 변수
         self.state = "CRUISE"
         self.last_command = ""
         self.stop_start_time = 0.0
@@ -38,16 +38,15 @@ class ControlHandler(Node):
             self.last_command = cmd_str
             self.get_logger().info(f"Sent to ESP32: {cmd_str}")
         
-        # 현재 상태를 비전 노드로 공유 (디버그 텍스트 동기화용)
+        # 비전 노드로 상태 송신
         state_msg = String()
         display_state = f"{self.state} Step{self.avoid_substate}" if self.state == "AVOID" else self.state
-        if self.waiting_for_esp:
-            display_state += " [WAIT]"
+        if self.waiting_for_esp: display_state += " [WAIT]"
         state_msg.data = f"{display_state}|{self.last_command}"
         self.state_pub.publish(state_msg)
 
     def vision_callback(self, msg):
-        # 데이터 언팩 (에러값|정지선|장애물전방|횡단보도|회피방향|장애물자체여부)
+        # 데이터 언팩 (에러값|정지선|장애물전방|횡단보도|회피방향|장애물자체|노란선여부)
         try:
             data = msg.data.split('|')
             error = float(data[0])
@@ -56,18 +55,17 @@ class ControlHandler(Node):
             crosswalk_detected = bool(int(data[3]))
             avoid_dir = int(data[4])
             obstacle_detected = bool(int(data[5]))
+            yellow_line_detected = bool(int(data[6])) # 추가된 노란선 정보
         except (ValueError, IndexError):
             return
 
-        # ── 래치 해제 제어 ──
-        if not red_line_detected:
-            self.red_line_latched = False
-        if not obstacle_detected:
-            self.obstacle_latched = False
+        # 래치 해제
+        if not red_line_detected: self.red_line_latched = False
+        if not obstacle_detected: self.obstacle_latched = False
 
         current_time = time.time()
 
-        # ── 상태 전환 FSM ──
+        # FSM 상태 전환
         if self.state == "CRUISE" and not crosswalk_detected:
             if red_line_detected and not self.red_line_latched:
                 self.state = "STOP_TIMER"
@@ -79,9 +77,7 @@ class ControlHandler(Node):
                 self.waiting_for_esp = False
                 self.avoid_direction = avoid_dir
 
-        # ── FSM 명령 실행 (원본 구조 100% 보존) ──
-        
-        # 횡단보도 위 처리
+        # FSM 명령 실행
         if crosswalk_detected and self.state != "AVOID":
             self.last_command = ""
             self.send_command("G200")
@@ -93,23 +89,43 @@ class ControlHandler(Node):
                 self.send_command("S")
 
         elif self.state == "AVOID":
-            if not self.waiting_for_esp:
-                if self.avoid_substate == 1:
+            
+            # [Step 1] 45도 회전 시작
+            if self.avoid_substate == 1:
+                if not self.waiting_for_esp:
                     self.send_command(f"T{45 * self.avoid_direction}")
-                    self.waiting_for_esp = True
-                    self.avoid_substate = 2
-                elif self.avoid_substate == 2:
+                    self.waiting_for_esp = True  # 회전이 끝날 때까지 락(WAIT)
+                    self.avoid_substate = 2      # 다음 스텝으로 이동
+
+            # [Step 2] 회전 완료 대기 후 -> 우회 직진
+            elif self.avoid_substate == 2:
+                # 1. 45도 회전 중이라면 아무것도 안 하고 대기 (화면에 [WAIT] 뜸)
+                if self.waiting_for_esp:
+                    return 
+                    
+                # 2. 회전이 완전히 끝나서 [WAIT]가 풀렸다면, 직진 시작
+                if not getattr(self, 'g_cmd_sent', False):
                     self.send_command("G200")
-                    self.waiting_for_esp = True
+                    self.g_cmd_sent = True
+                    # ❌ 절대 여기에 self.waiting_for_esp = True 를 넣지 마세요! ❌
+
+                # 3. 직진 중 노란선을 만나면 복귀 스텝으로 이동
+                if yellow_line_detected:  
                     self.avoid_substate = 3
-                elif self.avoid_substate == 3:
+                    self.g_cmd_sent = False # 플래그 초기화
+
+            # [Step 3] 다시 원래 차선으로 45도 복귀 회전
+            elif self.avoid_substate == 3:
+                if not self.waiting_for_esp:
                     self.send_command(f"T{-45 * self.avoid_direction}")
-                    self.waiting_for_esp = True
+                    self.waiting_for_esp = True # 다시 회전 대기 락(WAIT)
                     self.avoid_substate = 4
-                elif self.avoid_substate == 4:
+
+            # [Step 4] 일반 주행 모드로 복귀
+            elif self.avoid_substate == 4:
+                if not self.waiting_for_esp:
                     self.state = "CRUISE"
-                    self.obstacle_latched = True
-                    self.last_command = ""
+                    self.avoid_substate = 1
 
         elif self.state == "CRUISE":
             if abs(error) < 10:
