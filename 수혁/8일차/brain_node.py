@@ -39,10 +39,6 @@ class ControlHandler(Node):
         # 기본 직진 속도 설정 (요청 반영)
         self.current_speed = 115
 
-    # 감속 표지판 확인 시 속도를 80으로 줄이는 콜백
-    def yolo_callback(self, msg):
-        if msg.data.strip() == "SLOW":
-            self.current_speed = 80
 
     def status_callback(self, msg):
         if msg.data == "DONE":
