@@ -1,23 +1,33 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image, CompressedImage  # CompressedImage 추가
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 
+
 class VisionNode(Node):
     def __init__(self):
         super().__init__('vision_node')
         self.image_sub = self.create_subscription(
-            Image, 'image_raw/compressed', self.image_callback, qos_profile_sensor_data)
+            Image, '/camera/image_raw', self.image_callback, qos_profile_sensor_data)
         
         # 제어 노드로 비전 분석 결과를 송신할 퍼블리셔
         self.vision_pub = self.create_publisher(String, '/vision_status', 10)
         
         # 제어 노드의 현재 상태를 화면에 그려주기 위한 서브스크라이버
         self.state_sub = self.create_subscription(String, '/control_state', self.state_callback, 10)
+        
+        # [변경] 디버깅 영상을 BEST_EFFORT 프로파일로 발행할 압축 이미지 퍼블리셔 생성
+        best_effort_qos = QoSProfile(
+            reliability=ReliPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.image_pub = self.create_publisher(CompressedImage, '/image_line/compressed', best_effort_qos)
         
         self.bridge = CvBridge()
 
@@ -60,11 +70,11 @@ class VisionNode(Node):
             self.last_valid_target_x = width // 2
 
         # ── 마스킹 ──
-        mask_yellow = cv2.inRange(hsv, np.array([20, 100, 100]), np.array([40, 255, 255]))
-        mask_black_raw = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 50]))
-        mask_gray = cv2.inRange(hsv, np.array([0, 0, 50]), np.array([180, 50, 180]))
+        mask_yellow = cv2.inRange(hsv, np.array([25, 83, 95]), np.array([41, 255, 255]))
+        mask_black_raw = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 102]))
+        mask_gray = cv2.inRange(hsv, np.array([0, 0, 185]), np.array([180, 18, 255]))
         mask_red = cv2.bitwise_or(
-            cv2.inRange(hsv, np.array([0, 120, 70]), np.array([10, 255, 255])),
+            cv2.inRange(hsv, np.array([0, 32, 49]), np.array([12, 255, 255])),
             cv2.inRange(hsv, np.array([170, 120, 70]), np.array([180, 255, 255]))
         )
 
@@ -176,18 +186,26 @@ class VisionNode(Node):
 
         mask_row = cv2.resize(np.hstack([m_y, m_b, m_o, m_r]), (roi_w, cell_h))
         debug_final = np.vstack([overlay, mask_row])
-        cv2.imshow("Lane Follower Debug", debug_final)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            self.destroy_node()
-            rclpy.shutdown()
+        # ── [변경] cv2.imshow 제거 및 BEST_EFFORT 압축 토픽 발행 ──
+        compressed_msg = CompressedImage()
+        compressed_msg.header.stamp = self.get_clock().now().to_msg()
+        compressed_msg.header.frame_id = "camera_frame"
+        compressed_msg.format = "jpeg"
+        compressed_msg.data = cv2.imencode('.jpg', debug_final)[1].tobytes()
+        
+        self.image_pub.publish(compressed_msg)
 
 def main(args=None):
     rclpy.init(args=args)
     node = VisionNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
