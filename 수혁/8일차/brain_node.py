@@ -1,7 +1,10 @@
+import os
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 import time
+
+os.envioron['ROS_DOMAIN_ID'] = '30'
 
 class ControlHandler(Node):
     def __init__(self):
