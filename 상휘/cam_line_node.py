@@ -101,6 +101,8 @@ class VisionNode(Node):
                     obstacle_in_front = True
 
         red_line_detected = cv2.countNonZero(mask_red) > 5000
+        # [추가] 노란 차선 탐지 여부 (5000픽셀 이상이면 감지)
+        yellow_line_detected = cv2.countNonZero(mask_yellow) > 5000
 
         # ── 조향 목표 계산 ──
         if self.crosswalk_detected:
@@ -119,9 +121,9 @@ class VisionNode(Node):
         error = (width / 2) - target_x
 
         # ── 제어 노드로 데이터 패킹 전송 ──
-        # 구조: 에러값|정지선감지|장애물전방|횡단보도감지|회피방향|장애물감지자체여부
+        # 구조: 에러값|정지선|장애물전방|횡단보도|회피방향|장애물여부|노란선여부
         status_msg = String()
-        status_msg.data = f"{error}|{1 if red_line_detected else 0}|{1 if obstacle_in_front else 0}|{1 if self.crosswalk_detected else 0}|{avoid_direction}|{1 if obstacle_detected else 0}"
+        status_msg.data = f"{error}|{1 if red_line_detected else 0}|{1 if obstacle_in_front else 0}|{1 if self.crosswalk_detected else 0}|{avoid_direction}|{1 if obstacle_detected else 0}|{1 if yellow_line_detected else 0}"
         self.vision_pub.publish(status_msg)
 
         # ══════════════════════════════════════════════
@@ -170,7 +172,7 @@ class VisionNode(Node):
         m_y = cv2.resize(make_mask_vis(mask_yellow, (0, 220, 220), "YELLOW"),   (cell_w, cell_h))
         m_b = cv2.resize(make_mask_vis(mask_black,  (0, 255, 0),   "BLACK"),    (cell_w, cell_h))
         m_o = cv2.resize(make_mask_vis(mask_gray,   (255, 200, 0), "OBSTACLE"), (cell_w, cell_h))
-        m_r = cv2.resize(make_mask_vis(mask_red,    (0, 0, 255),   "RED"),      (cell_w, cell_h))
+        m_r = cv2.resize(make_mask_vis(mask_red,    (0, 0, 255),   "RED"),      (cell_h, cell_h))
 
         mask_row = cv2.resize(np.hstack([m_y, m_b, m_o, m_r]), (roi_w, cell_h))
         debug_final = np.vstack([overlay, mask_row])
