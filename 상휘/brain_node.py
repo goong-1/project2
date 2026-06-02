@@ -11,9 +11,13 @@ class ControlHandler(Node):
         # Virtual ESP32 토픽 통신
         self.status_sub = self.create_subscription(String, '/esp_status', self.status_callback, 10)
         self.publisher = self.create_publisher(String, '/esp_command', 10)
-        
+
         # 비전 창 업데이트용 상태 퍼블리셔
         self.state_pub = self.create_publisher(String, '/control_state', 10)
+
+        # ★ [추가 이식됨] 0.2초 주기로 마지막 명령을 지속 전송하는 타이머 (ESP32 타임아웃 방지)
+        self.transmit_interval = 0.2
+        self.transmit_timer = self.create_timer(self.transmit_interval, self.timer_fallback_transmit)
 
         # FSM 변수
         self.state = "CRUISE"
@@ -28,7 +32,16 @@ class ControlHandler(Node):
     def status_callback(self, msg):
         if msg.data == "DONE":
             self.waiting_for_esp = False
+            self.last_command = ""
             self.get_logger().info("ESP32 작업 완료 신호(DONE) 접수.")
+
+    # ★ [추가 이식됨] 하드웨어 멈춤 방지용 백그라운드 송신 함수
+    def timer_fallback_transmit(self):
+        """ 타이머에 의해 0.2초마다 마지막 명령을 반복 전송하여 하드웨어 정지 방지 """
+        if self.last_command:
+            msg = String()
+            msg.data = self.last_command
+            self.publisher.publish(msg)
 
     def send_command(self, cmd_str):
         if cmd_str != self.last_command:
@@ -37,7 +50,7 @@ class ControlHandler(Node):
             self.publisher.publish(msg)
             self.last_command = cmd_str
             self.get_logger().info(f"Sent to ESP32: {cmd_str}")
-        
+
         # 비전 노드로 상태 송신
         state_msg = String()
         display_state = f"{self.state} Step{self.avoid_substate}" if self.state == "AVOID" else self.state
@@ -89,7 +102,7 @@ class ControlHandler(Node):
                 self.send_command("S")
 
         elif self.state == "AVOID":
-            
+
             # [Step 1] 45도 회전 시작
             if self.avoid_substate == 1:
                 if not self.waiting_for_esp:
@@ -101,8 +114,8 @@ class ControlHandler(Node):
             elif self.avoid_substate == 2:
                 # 1. 45도 회전 중이라면 아무것도 안 하고 대기 (화면에 [WAIT] 뜸)
                 if self.waiting_for_esp:
-                    return 
-                    
+                    return
+
                 # 2. 회전이 완전히 끝나서 [WAIT]가 풀렸다면, 직진 시작
                 if not getattr(self, 'g_cmd_sent', False):
                     self.send_command("G200")
@@ -110,7 +123,7 @@ class ControlHandler(Node):
                     # ❌ 절대 여기에 self.waiting_for_esp = True 를 넣지 마세요! ❌
 
                 # 3. 직진 중 노란선을 만나면 복귀 스텝으로 이동
-                if yellow_line_detected:  
+                if yellow_line_detected:
                     self.avoid_substate = 3
                     self.g_cmd_sent = False # 플래그 초기화
 
