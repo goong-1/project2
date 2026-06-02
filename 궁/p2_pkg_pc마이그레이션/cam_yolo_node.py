@@ -10,18 +10,20 @@
 PC는 라즈베리파이보다 강력하므로 YOLO 추론 부담을 흡수.
 """
 
+import time
+
 import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 import cv2
 import numpy as np
 from pathlib import Path
 
-from p2_pkg.sign_detector import TrafficSignDetector
+from cam_yolo_detector import TrafficSignDetector
 
 
 class CameraParserNode(Node):
@@ -30,7 +32,7 @@ class CameraParserNode(Node):
 
         # ── 모델 ──
         BASE_DIR   = Path(__file__).resolve().parent
-        MODEL_PATH = BASE_DIR / "best_n_model_v4_640p_2.pt"
+        MODEL_PATH = BASE_DIR / "cam_yolo.pt"
 
         self.detector = TrafficSignDetector(
             model_path=str(MODEL_PATH),
@@ -57,6 +59,12 @@ class CameraParserNode(Node):
         self.yolo_image_pub = self.create_publisher(
             CompressedImage, 'image_yolo/compressed', be_qos
         )
+        # ── 추론 시간(ms) 발행 ──
+        self.perf_pub = self.create_publisher(Float32, 'yolo_perf', 10)
+
+        # 추론 시간 평활화용 (최근 N개 이동평균)
+        self._infer_ema = None
+        self._ema_alpha = 0.2
 
         # ── 발행 빈도 (대시보드용 디버그 영상) ──
         self.yolo_frame_count    = 0
@@ -83,6 +91,7 @@ class CameraParserNode(Node):
         self.get_logger().info('   구독: /image_raw/compressed (from Pi)  ')
         self.get_logger().info('   발행: /traffic_sign_topic              ')
         self.get_logger().info('   발행: /image_yolo/compressed           ')
+        self.get_logger().info('   발행: /yolo_perf (추론시간 ms)          ')
         self.get_logger().info('==========================================')
 
     def image_callback(self, msg):
@@ -96,8 +105,22 @@ class CameraParserNode(Node):
             self.get_logger().error(f'JPEG 디코드 실패: {e}')
             return
 
-        # ── 객체 탐지 ──
+        # ── 객체 탐지 (추론 시간 측정) ──
+        t0 = time.perf_counter()
         all_detections = self.detector.detect_all(frame)
+        infer_ms = (time.perf_counter() - t0) * 1000.0
+
+        # 이동평균(EMA)으로 값 안정화
+        if self._infer_ema is None:
+            self._infer_ema = infer_ms
+        else:
+            self._infer_ema = (self._ema_alpha * infer_ms
+                               + (1 - self._ema_alpha) * self._infer_ema)
+
+        # 추론 시간 발행 (대시보드용)
+        perf_msg = Float32()
+        perf_msg.data = float(self._infer_ema)
+        self.perf_pub.publish(perf_msg)
         detections = self.filter_detections_by_roi(all_detections, frame)
 
         if not detections:
@@ -135,7 +158,9 @@ class CameraParserNode(Node):
         current_time = self.get_clock().now()
         elapsed = (current_time - self.last_print_time).nanoseconds / 1e9
         if elapsed > 0.5:
-            self.get_logger().info(f'[YOLO] action -> {action_hint}')
+            self.get_logger().info(
+                f'[YOLO] action -> {action_hint}  (추론 {self._infer_ema:.1f}ms)'
+            )
             self.last_print_time = current_time
 
     # ── 이하 원본과 동일 ────────────────────────────────────────

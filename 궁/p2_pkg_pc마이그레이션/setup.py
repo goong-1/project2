@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'p2_pkg'
+package_name = 'p2_pkg_pc'
 
 setup(
     name=package_name,
@@ -22,22 +22,22 @@ setup(
     entry_points={
         'console_scripts': [
             # [라즈베리파이] 카메라 발행
-            'cam_image_node     = p2_pkg.cam_image_node:main',
+            'cam_image_node     = p2_pkg_pc.cam_image_node:main',
 
             # [라즈베리파이] ESP32 브릿지
-            'bridge_node        = p2_pkg.bridge_node:main',
+            'bridge_node        = p2_pkg_pc.bridge_node:main',
 
             # [PC] 차선 감지
-            'cam_line_node      = p2_pkg.cam_line_node:main',
+            'cam_line_node      = p2_pkg_pc.cam_line_node:main',
 
             # [PC] YOLO 추론
-            'cam_yolo_node      = p2_pkg.cam_yolo_node:main',
+            'cam_yolo_node      = p2_pkg_pc.cam_yolo_node:main',
 
             # [PC] FSM 제어
-            'brain_node         = p2_pkg.brain_node:main',
+            'brain_node         = p2_pkg_pc.brain_node:main',
 
             # [PC] 웹 대시보드
-            'dashboard_node     = p2_pkg.dashboard_node:main',
+            'dashboard_node     = p2_pkg_pc.dashboard_node:main',
         ],
     },
 )
