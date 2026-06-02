@@ -4,13 +4,11 @@ from rclpy.node import Node
 from std_msgs.msg import String
 import serial
 
-os.environ['ROS_DOMAIN_ID'] = '30'
-
 class BridgeNode(Node):
     def __init__(self):
         super().__init__('bridge_node')
         
-        # ★ [기존 원본 코드 환경 완벽 반영] 시리얼 포트 설정 및 자동 최적화 오픈
+        # [기존 원본 코드 환경 완벽 반영] 시리얼 포트 설정 및 자동 최적화 오픈
         self.SERIAL_PORT = '/dev/ttyAMA0'
         
         try:
@@ -61,6 +59,8 @@ class BridgeNode(Node):
         if uart_packet and self.ser is not None:
             try:
                 self.ser.write(uart_packet.encode('utf-8'))
+                # ★ [추가 반영] 브레인 노드에서 명령이 전해지면 터미널 창에 실시간으로 로그를 출력합니다.
+                self.get_logger().info(f"[Brain -> Bridge] 수신: {raw_cmd} ➔ [UART 송신]: {uart_packet.strip()}")
             except Exception as e:
                 self.get_logger().error(f'[UART] 송신 에러: {e}')
 
