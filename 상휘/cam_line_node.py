@@ -11,7 +11,7 @@ class VisionNode(Node):
     def __init__(self):
         super().__init__('vision_node')
         self.image_sub = self.create_subscription(
-            Image, 'image_raw', self.image_callback, qos_profile_sensor_data)
+            Image, 'image_raw/compressed', self.image_callback, qos_profile_sensor_data)
         
         # 제어 노드로 비전 분석 결과를 송신할 퍼블리셔
         self.vision_pub = self.create_publisher(String, '/vision_status', 10)
