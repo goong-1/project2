@@ -1,47 +1,69 @@
 #!/usr/bin/env python3
+import os
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image, CompressedImage  # CompressedImage 추가
+from sensor_msgs.msg import CompressedImage  # 사용할 타입만 명확히 임포트
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 
+# ==============================================================================
+# [필수 추가] 카메라 노드와 동일한 네트워크 도메인 및 유니캐스트 환경 설정
+# ==============================================================================
+os.environ['ROS_DOMAIN_ID'] = '30'
+
+# 비전 노드가 실행되는 PC 및 통신할 피어들의 IP를 적어줍니다.
+TARGET_IP_1 = "192.168.0.125"
+TARGET_IP_2 = "192.168.0.110"
+TARGET_IP_3 = "192.168.0.155"
+
+os.environ['CYCLONEDDS_URI'] = f"""
+<CycloneDDS>
+    <Domain>
+        <General>
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <Peers>
+                <Peer Address="{TARGET_IP_1}"/>
+                <Peer Address="{TARGET_IP_2}"/>
+                <Peer Address="{TARGET_IP_3}"/>
+            </Peers>
+            <ParticipantIndex>auto</ParticipantIndex>
+        </Discovery>
+    </Domain>
+</CycloneDDS>
+"""
+# ==============================================================================
 
 class VisionNode(Node):
     def __init__(self):
         super().__init__('vision_node')
+        
+        # [수정] 구독 메시지 타입을 CompressedImage로 변경
         self.image_sub = self.create_subscription(
-            Image, '/camera/image_raw', self.image_callback, qos_profile_sensor_data)
+            CompressedImage, '/image_raw/compressed', self.image_callback, qos_profile_sensor_data)
         
-        # 제어 노드로 비전 분석 결과를 송신할 퍼블리셔
         self.vision_pub = self.create_publisher(String, '/vision_status', 10)
-        
-        # 제어 노드의 현재 상태를 화면에 그려주기 위한 서브스크라이버
         self.state_sub = self.create_subscription(String, '/control_state', self.state_callback, 10)
         
-        # [변경] 디버깅 영상을 BEST_EFFORT 프로파일로 발행할 압축 이미지 퍼블리셔 생성
         best_effort_qos = QoSProfile(
-            reliability=ReliPolicy.BEST_EFFORT,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
         self.image_pub = self.create_publisher(CompressedImage, '/image_line/compressed', best_effort_qos)
         
         self.bridge = CvBridge()
-
-        # 원본 변수 유지
         self.lane_width = 350
         self.last_valid_target_x = None
         self.crosswalk_detected = False
-        
-        # 디버그 표시용 변수
         self.current_control_state = "CRUISE"
         self.last_sent_cmd = ""
 
     def state_callback(self, msg):
-        # 제어 노드로부터 현재 FSM 상태와 마지막 나간 명령어를 받아와 디버그 창에 업데이트
         try:
             self.current_control_state, self.last_sent_cmd = msg.data.split('|')
         except ValueError:
@@ -60,7 +82,8 @@ class VisionNode(Node):
         return result, removed_rows
 
     def image_callback(self, msg):
-        cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+        # [수정] compressed_imgmsg_to_cv2 메서드로 변경하여 압축 이미지 디코딩
+        cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
         height, width, _ = cv_image.shape
         roi = cv_image[int(height/2):height, 0:width].copy()
         roi_h, roi_w = roi.shape[:2]
@@ -111,7 +134,6 @@ class VisionNode(Node):
                     obstacle_in_front = True
 
         red_line_detected = cv2.countNonZero(mask_red) > 5000
-        # [추가] 노란 차선 탐지 여부 (5000픽셀 이상이면 감지)
         yellow_line_detected = cv2.countNonZero(mask_yellow) > 5000
 
         # ── 조향 목표 계산 ──
@@ -131,14 +153,11 @@ class VisionNode(Node):
         error = (width / 2) - target_x
 
         # ── 제어 노드로 데이터 패킹 전송 ──
-        # 구조: 에러값|정지선|장애물전방|횡단보도|회피방향|장애물여부|노란선여부
         status_msg = String()
         status_msg.data = f"{error}|{1 if red_line_detected else 0}|{1 if obstacle_in_front else 0}|{1 if self.crosswalk_detected else 0}|{avoid_direction}|{1 if obstacle_detected else 0}|{1 if yellow_line_detected else 0}"
         self.vision_pub.publish(status_msg)
 
-        # ══════════════════════════════════════════════
-        # 디버그 시각화 (원본 로직 100% 동일 유지)
-        # ══════════════════════════════════════════════
+        # ── 디버그 시각화 및 퍼블리시 ──
         overlay = roi.copy()
         overlay[mask_yellow > 0] = (0, 220, 220)
         overlay[mask_black  > 0] = (0, 255, 0)
@@ -187,7 +206,6 @@ class VisionNode(Node):
         mask_row = cv2.resize(np.hstack([m_y, m_b, m_o, m_r]), (roi_w, cell_h))
         debug_final = np.vstack([overlay, mask_row])
 
-        # ── [변경] cv2.imshow 제거 및 BEST_EFFORT 압축 토픽 발행 ──
         compressed_msg = CompressedImage()
         compressed_msg.header.stamp = self.get_clock().now().to_msg()
         compressed_msg.header.frame_id = "camera_frame"
