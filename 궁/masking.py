@@ -1,5 +1,9 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridge
 import cv2
 import numpy as np
 
@@ -8,10 +12,16 @@ class ImageDisplayNode(Node):
     def __init__(self):
         super().__init__('image_display_node')
 
-        self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        # ROS 이미지를 OpenCV 이미지로 변환하기 위한 CvBridge 초기화
+        self.bridge = CvBridge()
+
+        # 웹캠 대신 압축 이미지 토픽 구독 (qos_profile_sensor_data 사용)
+        self.image_sub = self.create_subscription(
+            CompressedImage, 
+            'image_raw/compressed', 
+            self.image_callback, 
+            qos_profile_sensor_data
+        )
 
         self.window_name = "HSV Tuning"
         cv2.namedWindow(self.window_name)
@@ -24,12 +34,16 @@ class ImageDisplayNode(Node):
 
         cv2.createTrackbar("V_LOW_bright_min", self.window_name, 100, 255, lambda x: None)
         cv2.createTrackbar("V_HIGH_bright_max", self.window_name, 255, 255, lambda x: None)
-        self.timer = self.create_timer(0.033, self.timer_callback)
+        
         self.get_logger().info("HSV Tuning Started. Press 's' to save values, 'q' to quit.")
 
-    def timer_callback(self):
-        ret, frame = self.cap.read()
-        if not ret:
+    # 타이머 대신 이미지가 들어올 때마다 콜백 함수가 실행되도록 변경
+    def image_callback(self, msg):
+        try:
+            # CompressedImage 메시지를 OpenCV BGR 이미지로 변환
+            frame = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert image: {e}")
             return
 
         frame = cv2.resize(frame, (320, 240))
@@ -63,13 +77,13 @@ class ImageDisplayNode(Node):
 
         if key == ord('s'):
             print()
-            print("현재 HSV 범위")
+            print("========== [현재 HSV 범위] ==========")
             print(f"lower = np.array([{h_min}, {s_min}, {v_min}])")
             print(f"upper = np.array([{h_max}, {s_max}, {v_max}])")
+            print("=====================================")
             print()
 
         elif key == ord('q'):
-            self.cap.release()
             cv2.destroyAllWindows()
             rclpy.shutdown()
 
@@ -83,7 +97,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.cap.release()
         cv2.destroyAllWindows()
         if rclpy.ok():
             node.destroy_node()
