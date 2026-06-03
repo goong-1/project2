@@ -93,8 +93,8 @@ class VisionNode(Node):
             self.last_valid_target_x = width // 2
 
         # ── 마스킹 ──
-        mask_yellow = cv2.inRange(hsv, np.array([25, 83, 95]), np.array([41, 255, 255]))
-        mask_black_raw = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 102]))
+        mask_yellow = cv2.inRange(hsv, np.array([20, 65, 120]), np.array([41, 255, 255]))
+        mask_black_raw = cv2.inRange(hsv, np.array([47, 0, 96]), np.array([180, 255, 132]))
         mask_gray = cv2.inRange(hsv, np.array([0, 0, 185]), np.array([180, 18, 255]))
         mask_red = cv2.bitwise_or(
             cv2.inRange(hsv, np.array([0, 32, 49]), np.array([12, 255, 255])),
