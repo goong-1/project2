@@ -9,7 +9,6 @@ os.environ['ROS_DOMAIN_ID'] = '30'
 class ControlHandler(Node):
     def __init__(self):
         super().__init__('control_handler')
-        # 비전 및 ESP32 통신 토픽 구조 (원본 유지)
         self.vision_sub = self.create_subscription(String, '/vision_status', self.vision_callback, 10)
         self.status_sub = self.create_subscription(String, '/esp_status', self.status_callback, 10)
         self.publisher = self.create_publisher(String, '/esp_command', 10)
@@ -35,23 +34,23 @@ class ControlHandler(Node):
         self.waiting_for_esp = False
         self.current_speed = 115
 
-        # ★ 터미널 로깅 및 신호 모니터링을 위한 변수 추가
         self.last_vision_time = time.time()
         self.last_yolo_time = time.time()
         self.last_change_log_time = 0.0
         self.last_logged_state = ""
         self.last_logged_cmd = ""
         
-        # 2초 주기 상태 모니터링 타이머
+        self.vision_warned = False
+        self.yolo_warned = False
+        self.both_warned = False
+        
         self.monitor_timer = self.create_timer(2.0, self.monitor_status)
 
-    # ★ 1줄 형태의 깔끔한 터미널 출력 전용 함수
     def print_log(self, is_change=False, reason=""):
         display_state = f"{self.state} Step{self.avoid_substate}" if self.state == "AVOID" else self.state
         if self.state == "YOLO_TURN_LEFT": display_state = f"{self.state} Step{self.turn_left_substate}"
         if self.waiting_for_esp: display_state += " [WAIT]"
 
-        # 1줄 포맷 구성
         log_str = f"상태: [{display_state: <15}] | 명령: [{self.last_command: <4}] | 속도: [{self.current_speed: <3}]"
         if reason:
             log_str += f" ◀ 판단: {reason}"
@@ -64,20 +63,34 @@ class ControlHandler(Node):
         else:
             self.get_logger().info(f"▶️ [명령 유지] {log_str}")
 
-    # ★ 2초 주기 신호 점검 및 유지 로깅
     def monitor_status(self):
         current_time = time.time()
         vision_delayed = (current_time - self.last_vision_time) > 2.0
         yolo_delayed = (current_time - self.last_yolo_time) > 2.0
 
         if vision_delayed and yolo_delayed:
-            self.get_logger().warning("⚠️ [신호 경고] 카메라(Line) 및 YOLO 신호가 2초 이상 끊겼습니다!")
-        elif vision_delayed:
-            self.get_logger().warning("⚠️ [신호 경고] 카메라(Line) 신호가 2초 이상 끊겼습니다!")
-        elif yolo_delayed:
-            self.get_logger().warning("⚠️ [신호 경고] YOLO 신호가 2초 이상 끊겼습니다!")
+            if not self.both_warned:
+                self.get_logger().warning("⚠️ [신호 경고] 차선 감지(Line)와 YOLO 신호가 모두 없습니다. (기본 대기 상태)")
+                self.both_warned = True
+                self.vision_warned = False
+                self.yolo_warned = False
+        elif vision_delayed and not yolo_delayed:
+            if not self.vision_warned:
+                self.get_logger().warning("⚠️ [신호 경고] YOLO 신호는 들어오지만 차선 감지(Line) 신호가 없습니다. (주행 판단 불가/대기 중)")
+                self.vision_warned = True
+                self.both_warned = False
+        elif not vision_delayed and yolo_delayed:
+            if not self.yolo_warned:
+                self.get_logger().warning("⚠️ [신호 경고] 차선 감지(Line) 신호는 정상이지만 YOLO 신호가 없습니다. (표지판 무시 모드)")
+                self.yolo_warned = True
+                self.both_warned = False
         else:
-            # 상태 변경이 없을 때는 2초마다 현재 유지 중인 행동 1줄 출력
+            if self.vision_warned or self.yolo_warned or self.both_warned:
+                self.get_logger().info("✅ [신호 복구] 라인과 YOLO 신호가 모두 정상적으로 들어오고 있습니다.")
+                self.vision_warned = False
+                self.yolo_warned = False
+                self.both_warned = False
+            
             if current_time - self.last_change_log_time >= 2.0:
                 self.print_log(is_change=False, reason="입력 대기 (유지 중)")
 
@@ -92,7 +105,6 @@ class ControlHandler(Node):
             self.waiting_for_esp = False
             self.last_command = ""
             self.current_speed = 115 
-            # (도배 방지를 위해 DONE 수신 출력은 제거하고 상태 전환 로그에 맡깁니다)
 
     def timer_fallback_transmit(self):
         if self.last_command:
@@ -128,10 +140,11 @@ class ControlHandler(Node):
 
     def vision_callback(self, msg):
         self.last_vision_time = time.time()
-        current_reason = "" # 이번 틱에서 상태 변경/판단을 한 이유를 저장할 변수
+        current_reason = "" 
 
         try:
             data = msg.data.split('|')
+                
             error = float(data[0])
             red_line_detected = bool(int(data[1]))
             obstacle_in_front = bool(int(data[2]))
@@ -156,7 +169,6 @@ class ControlHandler(Node):
                 current_reason = "감속 구간 5초 종료 -> 일반 속도 복구"
             self.current_speed = 115
 
-        # FSM 상태 전환
         if self.state == "CRUISE" and not crosswalk_detected:
             if getattr(self, 'yolo_action', 'GO') == "STOP":
                 current_reason = "YOLO 정지(STOP) 신호 감지 -> 정지"
@@ -193,7 +205,7 @@ class ControlHandler(Node):
 
         elif self.state == "YOLO_TURN_LEFT":
             if obstacle_in_front and not self.obstacle_latched:
-                current_reason = "🚨 좌회전 중 전방 장애물 발생 -> 긴급 회피 전환"
+                current_reason = "좌회전 중 전방 장애물 발생 -> 긴급 회피 전환"
                 self.state = "AVOID"
                 self.avoid_substate = 1
                 self.waiting_for_esp = False
@@ -289,15 +301,11 @@ class ControlHandler(Node):
                 else:
                     self.send_command(f"G{self.current_speed}")
 
-        # ★ 1틱(vision_callback) 종료 시점에 변경 사항 및 이벤트 통합 출력 처리
         state_changed = (self.state != self.last_logged_state)
         cmd_changed = (self.last_command != getattr(self, 'last_logged_cmd', ""))
         
-        # 상태가 변했거나, 명령이 변했거나, 특별한 이유(current_reason)가 생겼을 때만 출력
         if state_changed or cmd_changed or current_reason:
-            # 최소 출력 주기를 0.5초로 두어 터미널 도배 방지 (명령이 너무 잦게 바뀔 때)
             if current_time - self.last_change_log_time >= 0.5:
-                # current_reason이 없을 때의 기본 판단 멘트
                 if not current_reason:
                     if cmd_changed and self.state == "CRUISE": current_reason = "차선 오차 보정 조향"
                     else: current_reason = "진행 상태 변경"
