@@ -9,29 +9,22 @@ os.environ['ROS_DOMAIN_ID'] = '30'
 class ControlHandler(Node):
     def __init__(self):
         super().__init__('control_handler')
-        # 비전 노드 정보 구독 (원본 유지)
+        # 비전 및 ESP32 통신 토픽 구조 (원본 유지)
         self.vision_sub = self.create_subscription(String, '/vision_status', self.vision_callback, 10)
-        
-        # Virtual ESP32 토픽 통신 (원본 유지)
         self.status_sub = self.create_subscription(String, '/esp_status', self.status_callback, 10)
         self.publisher = self.create_publisher(String, '/esp_command', 10)
-
-        # 비전 창 업데이트용 상태 퍼블리셔 (원본 유지)
         self.state_pub = self.create_publisher(String, '/control_state', 10)
-
-        # ★ YOLO 정보 구독 및 상태 변수 (좌회전 시퀀스 변수 추가)
         self.yolo_sub = self.create_subscription(String, '/traffic_sign_topic', self.yolo_callback, 10)
+
         self.yolo_action = "GO"
         self.speed_limit_end_time = 0.0
         self.turn_left_substate = 1
         self.turn_left_timer = 0.0
         self.tl_g_sent = False
 
-        # ★ [원본 유지] 0.2초 주기로 마지막 명령을 지속 전송하는 타이머 (ESP32 타임아웃 방지)
         self.transmit_interval = 0.2
         self.transmit_timer = self.create_timer(self.transmit_interval, self.timer_fallback_transmit)
 
-        # FSM 변수 (원본 유지)
         self.state = "CRUISE"
         self.last_command = ""
         self.stop_start_time = 0.0
@@ -40,11 +33,56 @@ class ControlHandler(Node):
         self.avoid_direction = 0
         self.avoid_substate = 0
         self.waiting_for_esp = False
-        
-        # 기본 직진 속도 설정
         self.current_speed = 115
 
+        # ★ 터미널 로깅 및 신호 모니터링을 위한 변수 추가
+        self.last_vision_time = time.time()
+        self.last_yolo_time = time.time()
+        self.last_change_log_time = 0.0
+        self.last_logged_state = ""
+        self.last_logged_cmd = ""
+        
+        # 2초 주기 상태 모니터링 타이머
+        self.monitor_timer = self.create_timer(2.0, self.monitor_status)
+
+    # ★ 1줄 형태의 깔끔한 터미널 출력 전용 함수
+    def print_log(self, is_change=False, reason=""):
+        display_state = f"{self.state} Step{self.avoid_substate}" if self.state == "AVOID" else self.state
+        if self.state == "YOLO_TURN_LEFT": display_state = f"{self.state} Step{self.turn_left_substate}"
+        if self.waiting_for_esp: display_state += " [WAIT]"
+
+        # 1줄 포맷 구성
+        log_str = f"상태: [{display_state: <15}] | 명령: [{self.last_command: <4}] | 속도: [{self.current_speed: <3}]"
+        if reason:
+            log_str += f" ◀ 판단: {reason}"
+
+        if is_change:
+            self.get_logger().info(f"🔄 [명령 변경] {log_str}")
+            self.last_change_log_time = time.time()
+            self.last_logged_state = self.state
+            self.last_logged_cmd = self.last_command
+        else:
+            self.get_logger().info(f"▶️ [명령 유지] {log_str}")
+
+    # ★ 2초 주기 신호 점검 및 유지 로깅
+    def monitor_status(self):
+        current_time = time.time()
+        vision_delayed = (current_time - self.last_vision_time) > 2.0
+        yolo_delayed = (current_time - self.last_yolo_time) > 2.0
+
+        if vision_delayed and yolo_delayed:
+            self.get_logger().warning("⚠️ [신호 경고] 카메라(Line) 및 YOLO 신호가 2초 이상 끊겼습니다!")
+        elif vision_delayed:
+            self.get_logger().warning("⚠️ [신호 경고] 카메라(Line) 신호가 2초 이상 끊겼습니다!")
+        elif yolo_delayed:
+            self.get_logger().warning("⚠️ [신호 경고] YOLO 신호가 2초 이상 끊겼습니다!")
+        else:
+            # 상태 변경이 없을 때는 2초마다 현재 유지 중인 행동 1줄 출력
+            if current_time - self.last_change_log_time >= 2.0:
+                self.print_log(is_change=False, reason="입력 대기 (유지 중)")
+
     def yolo_callback(self, msg):
+        self.last_yolo_time = time.time()
         self.yolo_action = msg.data
         if self.yolo_action == "SPEED_LIMIT":
             self.speed_limit_end_time = time.time() + 5.0
@@ -53,11 +91,10 @@ class ControlHandler(Node):
         if msg.data == "DONE":
             self.waiting_for_esp = False
             self.last_command = ""
-            self.current_speed = 115  # 작업 완료 후 직진 속도를 다시 기본(115)으로 복구
-            self.get_logger().info("ESP32 작업 완료 신호(DONE) 접수.")
+            self.current_speed = 115 
+            # (도배 방지를 위해 DONE 수신 출력은 제거하고 상태 전환 로그에 맡깁니다)
 
     def timer_fallback_transmit(self):
-        """ 타이머에 의해 0.2초마다 마지막 명령을 반복 전송하여 하드웨어 정지 방지 """
         if self.last_command:
             msg = String()
             msg.data = self.last_command
@@ -72,7 +109,6 @@ class ControlHandler(Node):
             msg.data = cmd_str
             self.publisher.publish(msg)
             self.last_command = cmd_str
-            self.get_logger().info(f"Sent to ESP32: {cmd_str}")
             
             if cmd_str.startswith("T") or cmd_str == "S":
                 self.waiting_for_esp = True
@@ -91,6 +127,9 @@ class ControlHandler(Node):
         self.state_pub.publish(state_msg)
 
     def vision_callback(self, msg):
+        self.last_vision_time = time.time()
+        current_reason = "" # 이번 틱에서 상태 변경/판단을 한 이유를 저장할 변수
+
         try:
             data = msg.data.split('|')
             error = float(data[0])
@@ -109,89 +148,100 @@ class ControlHandler(Node):
         current_time = time.time()
 
         if current_time < getattr(self, 'speed_limit_end_time', 0.0):
-            self.current_speed = 80
+            if self.current_speed != 80:
+                current_reason = "YOLO 감속(SPEED_LIMIT) 신호 확인 -> 5초간 감속"
+                self.current_speed = 80
         else:
+            if getattr(self, 'current_speed', 115) == 80:
+                current_reason = "감속 구간 5초 종료 -> 일반 속도 복구"
             self.current_speed = 115
 
         # FSM 상태 전환
         if self.state == "CRUISE" and not crosswalk_detected:
             if getattr(self, 'yolo_action', 'GO') == "STOP":
+                current_reason = "YOLO 정지(STOP) 신호 감지 -> 정지"
                 self.state = "YOLO_STOP"
             elif red_line_detected and not self.red_line_latched:
+                current_reason = "바닥 정지선(Red Line) 감지 -> 1.5초 정지 타이머"
                 self.state = "STOP_TIMER"
                 self.stop_start_time = current_time
                 self.red_line_latched = True
             elif obstacle_in_front and not self.obstacle_latched:
+                current_reason = "전방 장애물 감지 -> 회피 기동 진입"
                 self.state = "AVOID"
                 self.avoid_substate = 1
                 self.waiting_for_esp = False
                 self.avoid_direction = avoid_dir
-            # ★ 좌회전 신호 진입 시퀀스 설정
             elif getattr(self, 'yolo_action', 'GO') == "TURN_LEFT":
+                current_reason = "YOLO 좌회전 신호 감지 -> 시퀀스 진입"
                 self.state = "YOLO_TURN_LEFT"
                 self.turn_left_substate = 1
                 self.turn_left_timer = current_time
 
-        # ★ 횡단보도 감지 시 정밀 주행 유지 (회피 및 좌회전 시퀀스 중에는 간섭 금지)
         if crosswalk_detected and self.state not in ["AVOID", "YOLO_TURN_LEFT"]:
             self.last_command = ""
             self.send_command(f"G{self.current_speed}")
+            if getattr(self, 'last_logged_cmd', "") != self.last_command:
+                current_reason = "횡단보도 위 -> 조향 잠금 및 직진 통과"
 
         elif self.state == "YOLO_STOP":
             if getattr(self, 'yolo_action', 'GO') == "GO":
+                current_reason = "YOLO 초록불(GO) 감지 -> 주행 재개"
                 self.state = "CRUISE"
             else:
                 self.send_command("S")
 
-        # ★ 하드코딩된 좌회전 시퀀스
         elif self.state == "YOLO_TURN_LEFT":
             if obstacle_in_front and not self.obstacle_latched:
+                current_reason = "🚨 좌회전 중 전방 장애물 발생 -> 긴급 회피 전환"
                 self.state = "AVOID"
                 self.avoid_substate = 1
                 self.waiting_for_esp = False
                 self.avoid_direction = avoid_dir
             else:
-                # [Step 1] 1초 직진
                 if self.turn_left_substate == 1:
                     if current_time - self.turn_left_timer <= 1.0:
                         self.send_command(f"G{self.current_speed}")
                     else:
+                        current_reason = "좌회전 1초 직진 완료 -> 45도 회전 시작"
                         self.turn_left_substate = 2
 
-                # [Step 2] 왼쪽으로 45도 회전
                 elif self.turn_left_substate == 2:
                     if not self.waiting_for_esp:
                         self.send_command("T45")
+                        current_reason = "좌회전 1차 45도 회전 대기"
                         self.turn_left_substate = 3
 
-                # [Step 3] 회전 완료 대기 후 0.5초 직진
                 elif self.turn_left_substate == 3:
                     if self.waiting_for_esp:
-                        return
-                    
-                    if not self.tl_g_sent:
-                        self.turn_left_timer = current_time
-                        self.tl_g_sent = True
-                    
-                    if current_time - self.turn_left_timer <= 0.5:
-                        self.send_command(f"G{self.current_speed}")
+                        pass
                     else:
-                        self.turn_left_substate = 4
-                        self.tl_g_sent = False
+                        if not self.tl_g_sent:
+                            self.turn_left_timer = current_time
+                            self.tl_g_sent = True
+                            current_reason = "좌회전 1차 회전 완료 -> 0.5초 직진"
+                        
+                        if current_time - self.turn_left_timer <= 0.5:
+                            self.send_command(f"G{self.current_speed}")
+                        else:
+                            current_reason = "좌회전 0.5초 직진 완료 -> 복귀 회전 시작"
+                            self.turn_left_substate = 4
+                            self.tl_g_sent = False
 
-                # [Step 4] 다시 왼쪽으로 45도 회전
                 elif self.turn_left_substate == 4:
                     if not self.waiting_for_esp:
                         self.send_command("T45")
+                        current_reason = "좌회전 2차 45도 회전 대기"
                         self.turn_left_substate = 5
 
-                # [Step 5] 일반 주행 모드로 복귀 (직진)
                 elif self.turn_left_substate == 5:
                     if not self.waiting_for_esp:
+                        current_reason = "좌회전 시퀀스 모두 완료 -> 기본 주행 복귀"
                         self.state = "CRUISE"
 
         elif self.state == "STOP_TIMER":
             if current_time - self.stop_start_time > 1.5:
+                current_reason = "1.5초 정지 완료 -> 주행 재개"
                 self.state = "CRUISE"
             else:
                 self.send_command("S")
@@ -200,27 +250,32 @@ class ControlHandler(Node):
             if self.avoid_substate == 1:
                 if not self.waiting_for_esp:
                     self.send_command(f"T{45 * self.avoid_direction}")
+                    current_reason = f"회피 1단계: {45 * self.avoid_direction}도 회전"
                     self.avoid_substate = 2      
 
             elif self.avoid_substate == 2:
                 if self.waiting_for_esp:
-                    return
+                    pass
+                else:
+                    if not getattr(self, 'g_cmd_sent', False):
+                        self.send_command(f"G{self.current_speed}")
+                        current_reason = "회전 완료 -> 우회 직진 중"
+                        self.g_cmd_sent = True
 
-                if not getattr(self, 'g_cmd_sent', False):
-                    self.send_command(f"G{self.current_speed}")
-                    self.g_cmd_sent = True
-
-                if yellow_line_detected:
-                    self.avoid_substate = 3
-                    self.g_cmd_sent = False 
+                    if yellow_line_detected:
+                        current_reason = "노란선 감지 -> 차선 복귀 회전 준비"
+                        self.avoid_substate = 3
+                        self.g_cmd_sent = False 
 
             elif self.avoid_substate == 3:
                 if not self.waiting_for_esp:
                     self.send_command(f"T{-45 * self.avoid_direction}")
+                    current_reason = f"회피 3단계: {-45 * self.avoid_direction}도 복귀 회전"
                     self.avoid_substate = 4
 
             elif self.avoid_substate == 4:
                 if not self.waiting_for_esp:
+                    current_reason = "회피 기동 종료 -> 기본 주행 복귀"
                     self.state = "CRUISE"
                     self.avoid_substate = 1
 
@@ -229,7 +284,25 @@ class ControlHandler(Node):
                 self.send_command(f"G{self.current_speed}")
             else:
                 turn_deg = int(error * -0.1)
-                self.send_command(f"T{turn_deg}" if abs(turn_deg) >= 2 else f"G{self.current_speed}")
+                if abs(turn_deg) >= 2:
+                    self.send_command(f"T{turn_deg}")
+                else:
+                    self.send_command(f"G{self.current_speed}")
+
+        # ★ 1틱(vision_callback) 종료 시점에 변경 사항 및 이벤트 통합 출력 처리
+        state_changed = (self.state != self.last_logged_state)
+        cmd_changed = (self.last_command != getattr(self, 'last_logged_cmd', ""))
+        
+        # 상태가 변했거나, 명령이 변했거나, 특별한 이유(current_reason)가 생겼을 때만 출력
+        if state_changed or cmd_changed or current_reason:
+            # 최소 출력 주기를 0.5초로 두어 터미널 도배 방지 (명령이 너무 잦게 바뀔 때)
+            if current_time - self.last_change_log_time >= 0.5:
+                # current_reason이 없을 때의 기본 판단 멘트
+                if not current_reason:
+                    if cmd_changed and self.state == "CRUISE": current_reason = "차선 오차 보정 조향"
+                    else: current_reason = "진행 상태 변경"
+                
+                self.print_log(is_change=True, reason=current_reason)
 
 def main(args=None):
     rclpy.init(args=args)
