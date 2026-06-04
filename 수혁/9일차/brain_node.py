@@ -1,10 +1,10 @@
-import os
+#import os
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Float32MultiArray
 import time
 
-os.environ['ROS_DOMAIN_ID'] = '30'
+#os.environ['ROS_DOMAIN_ID'] = '30'
 
 class ControlHandler(Node):
     def __init__(self):
