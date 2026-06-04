@@ -23,7 +23,7 @@ class VisionNode(Node):
         super().__init__('vision_node')
 
         self.image_sub = self.create_subscription(
-            Image, '/camera/image_raw', self.image_callback, qos_profile_sensor_data)
+            Image, '/image_raw/compressed', self.image_callback, qos_profile_sensor_data)
 
         self.vision_pub = self.create_publisher(String, '/vision_status', 10)
         self.state_sub  = self.create_subscription(String, '/control_state', self.state_callback, 10)
