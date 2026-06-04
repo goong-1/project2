@@ -1,240 +1,257 @@
+#!/usr/bin/env python3
+
+import os
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import String
-import time
-import threading
-import sys
-import tty
-import termios
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+
+os.environ['ROS_DOMAIN_ID'] = '30'
+
+TARGET_IP_1 = "192.168.0.125"
+TARGET_IP_2 = "192.168.0.110"
+TARGET_IP_3 = "192.168.0.155"
 
 
-class ControlHandler(Node):
+class VisionNode(Node):
 
     def __init__(self):
-        super().__init__('control_handler')
+        super().__init__('vision_node')
 
-        self.vision_sub = self.create_subscription(String, '/vision_status', self.vision_callback, 10)
-        self.status_sub = self.create_subscription(String, '/esp_status', self.status_callback, 10)
-        self.publisher  = self.create_publisher(String, '/esp_command', 10)
-        self.state_pub  = self.create_publisher(String, '/control_state', 10)
+        self.image_sub = self.create_subscription(
+            Image, '/camera/image_raw', self.image_callback, qos_profile_sensor_data)
 
-        self.transmit_interval = 0.2
-        self.transmit_timer = self.create_timer(self.transmit_interval, self.timer_fallback_transmit)
+        self.vision_pub = self.create_publisher(String, '/vision_status', 10)
+        self.state_sub  = self.create_subscription(String, '/control_state', self.state_callback, 10)
 
-        # FSM 변수
-        self.state             = "CRUISE"
-        self.last_command      = ""
-        self.stop_start_time   = 0.0
-        self.red_line_latched  = False
-        self.obstacle_latched  = False
-        self.avoid_direction   = 0
-        self.avoid_substate    = 0
-        self.waiting_for_esp   = False
-        self.current_speed     = 115
-
-        # ── PID 파라미터 ──
-        self.kp = 0.08   # 비례: 클수록 즉각 반응, 너무 크면 진동
-        self.ki = 0.001  # 적분: 누적 오차 보정, 너무 크면 과보정
-        self.kd = 0.05    # 미분: 급격한 변화 억제, 너무 크면 떨림
-
-        self.prev_error = 0.0
-        self.integral   = 0.0
-        self.prev_time  = time.time()
-
-        # 긴급 정지 플래그
-        self.emergency_stop = False
-
-        # 키보드 입력 스레드
-        self.kb_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
-        self.kb_thread.start()
-        self.get_logger().info("키보드 리스너 시작 — 's' 키: 긴급 정지 / 'r' 키: 재개")
-
-    # ─────────────────────────────────────────────
-    # 키보드 리스너
-    # ─────────────────────────────────────────────
-    def _keyboard_listener(self):
-        fd  = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while True:
-                ch = sys.stdin.read(1)
-                if ch == 's':
-                    self.emergency_stop = True
-                    self.get_logger().warn("🛑 긴급 정지 활성화 (재개: 'r')")
-                    self._force_stop()
-                elif ch == 'r':
-                    self.emergency_stop = False
-                    self.last_command   = ""
-                    # PID 상태 초기화 (정지 후 재개 시 적분 누적 리셋)
-                    self.prev_error = 0.0
-                    self.integral   = 0.0
-                    self.prev_time  = time.time()
-                    self.get_logger().info("▶ 긴급 정지 해제 — 주행 재개")
-                elif ch == '\x03':  # Ctrl+C
-                    break
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-    def _force_stop(self):
-        msg      = String()
-        msg.data = "S"
-        self.publisher.publish(msg)
-        self.last_command = "S"
-
-    # ─────────────────────────────────────────────
-    # ESP32 통신
-    # ─────────────────────────────────────────────
-    def status_callback(self, msg):
-        if msg.data == "DONE":
-            self.waiting_for_esp = False
-            self.last_command    = ""
-            self.current_speed   = 115
-            self.get_logger().info("ESP32 작업 완료 신호(DONE) 접수.")
-
-    def timer_fallback_transmit(self):
-        if self.emergency_stop:
-            self._force_stop()
-            return
-        if self.last_command:
-            msg      = String()
-            msg.data = self.last_command
-            self.publisher.publish(msg)
-
-    def send_command(self, cmd_str):
-        if self.emergency_stop:
-            return
-
-        if self.waiting_for_esp and cmd_str != self.last_command:
-            return
-
-        if cmd_str != self.last_command:
-            msg      = String()
-            msg.data = cmd_str
-            self.publisher.publish(msg)
-            self.last_command = cmd_str
-            self.get_logger().info(f"Sent to ESP32: {cmd_str}")
-
-            if cmd_str.startswith("T") or cmd_str == "S":
-                self.waiting_for_esp = True
-
-        elif cmd_str == self.last_command and self.waiting_for_esp:
-            msg      = String()
-            msg.data = cmd_str
-            self.publisher.publish(msg)
-
-        state_msg = String()
-        display_state = (
-            f"{self.state} Step{self.avoid_substate}"
-            if self.state == "AVOID" else self.state
+        best_effort_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
         )
-        if self.waiting_for_esp: display_state += " [WAIT]"
-        if self.emergency_stop:  display_state += " [E-STOP]"
-        state_msg.data = f"{display_state}|{self.last_command}"
-        self.state_pub.publish(state_msg)
+        self.image_pub = self.create_publisher(CompressedImage, '/image_line/compressed', best_effort_qos)
 
-    # ─────────────────────────────────────────────
-    # 비전 콜백 + FSM
-    # ─────────────────────────────────────────────
-    def vision_callback(self, msg):
-        if self.emergency_stop:
-            return
+        self.bridge    = CvBridge()
+        self.lane_width = 450
+        self.last_valid_target_x   = None
+        self.crosswalk_detected    = False
+        self.current_control_state = "CRUISE"
+        self.last_sent_cmd         = ""
 
+    def state_callback(self, msg):
         try:
-            data = msg.data.split('|')
-            error                = float(data[0])
-            red_line_detected    = bool(int(data[1]))
-            crosswalk_detected   = bool(int(data[2]))
-            yellow_line_detected = bool(int(data[3]))
-            avoid_direction      = int(data[4])
-        except (ValueError, IndexError):
-            return
+            self.current_control_state, self.last_sent_cmd = msg.data.split('|')
+        except ValueError:
+            pass
 
-        if not red_line_detected: self.red_line_latched = False
-        #if not obstacle_detected: self.obstacle_latched = False
+    def remove_crosswalk(self, mask_black):
+        result = mask_black.copy()
+        removed_rows = 0
+        for y in range(mask_black.shape[0]):
+            row = mask_black[y, :]
+            transitions = np.diff(row.astype(int))
+            runs = int(np.sum(transitions > 0))
+            if runs >= 3:
+                result[y, :] = 0
+                removed_rows += 1
+        return result, removed_rows
 
-        current_time = time.time()
+    def filter_by_angle(self, mask, min_area=300, max_area=8000,
+                         min_angle=25.0, max_angle=65.0):
+        result = np.zeros_like(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # ── 상태 전환 ──
-        if self.state == "CRUISE" and not crosswalk_detected:
-            if red_line_detected and not self.red_line_latched:
-                self.state            = "STOP_TIMER"
-                self.stop_start_time  = current_time
-                self.red_line_latched = True
-            # elif obstacle_in_front and not self.obstacle_latched:
-            #     self.state           = "AVOID"
-            #     self.avoid_substate  = 1
-            #     self.waiting_for_esp = False
-            #     self.avoid_direction = avoid_dir
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
 
-        # ── 명령 실행 ──
-        if crosswalk_detected and self.state != "AVOID":
-            self.last_command = ""
-            self.send_command(f"G{self.current_speed}")
-
-        elif self.state == "STOP_TIMER":
-            if current_time - self.stop_start_time > 1.5:
-                self.state = "CRUISE"
+            if len(cnt) < 5:
+                x, y, w, h = cv2.boundingRect(cnt)
+                angle = np.degrees(np.arctan2(h, w + 1e-5))
             else:
-                self.send_command("S")
+                pts = cnt.reshape(-1, 2).astype(np.float32)
+                _, eigenvectors = cv2.PCACompute(pts, mean=None)
+                vx, vy = eigenvectors[0]
+                angle = np.degrees(np.arctan2(abs(vy), abs(vx)))
 
-        elif self.state == "AVOID":
-            if self.avoid_substate == 1:
-                if not self.waiting_for_esp:
-                    self.send_command(f"T{45 * self.avoid_direction}")
-                    self.avoid_substate = 2
+            if min_angle <= angle <= max_angle:
+                cv2.drawContours(result, [cnt], -1, 255, thickness=cv2.FILLED)
 
-            elif self.avoid_substate == 2:
-                if self.waiting_for_esp:
-                    return
-                if not getattr(self, 'g_cmd_sent', False):
-                    self.send_command(f"G{self.current_speed}")
-                    self.g_cmd_sent = True
-                if yellow_line_detected:
-                    self.avoid_substate = 3
-                    self.g_cmd_sent     = False
+        return result
 
-            elif self.avoid_substate == 3:
-                if not self.waiting_for_esp:
-                    self.send_command(f"T{-45 * self.avoid_direction}")
-                    self.avoid_substate = 4
+    def image_callback(self, msg):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            roi      = cv_image.copy()
+            roi_h, roi_w = roi.shape[:2]
 
-            elif self.avoid_substate == 4:
-                if not self.waiting_for_esp:
-                    self.state          = "CRUISE"
-                    self.avoid_substate = 1
+            roi_vertices = np.array([[
+                (0,   400),
+                (240, 200),
+                (400, 200),
+                (640, 400)
+            ]], dtype=np.int32)
 
-        elif self.state == "CRUISE":
-            # ── PID 제어 ──
-            now = time.time()
-            dt  = now - self.prev_time
-            if dt <= 0:
-                dt = 0.01
+            poly_mask = np.zeros_like(roi)
+            cv2.fillPoly(poly_mask, roi_vertices, (255, 255, 255))
+            roi = cv2.bitwise_and(roi, poly_mask)
 
-            self.integral += error * dt
-            self.integral  = max(-500.0, min(500.0, self.integral))  # 와인드업 방지
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-            derivative = (error - self.prev_error) / dt
-            pid_output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+            if self.last_valid_target_x is None:
+                self.last_valid_target_x = roi_w // 2
 
-            self.prev_error = error
-            self.prev_time  = now
+            # ── 마스킹 ──
+            mask_yellow    = cv2.inRange(hsv, np.array([20,  65, 120]), np.array([41,  255, 255]))
+            mask_black_raw = cv2.inRange(hsv, np.array([47,   0,  96]), np.array([180, 255, 132]))
+            mask_red = cv2.bitwise_or(
+                cv2.inRange(hsv, np.array([0,   30,  49]), np.array([12,  255, 255])),
+                cv2.inRange(hsv, np.array([170, 120,  70]), np.array([180, 255, 255]))
+            )
 
-            turn_deg = int(-pid_output)
-            turn_deg = max(-30, min(30, turn_deg))  # 최대 조향각 ±30도 제한
+            # ── 기울기 + 면적 필터로 그림자 제거 ──
+            mask_black_filtered = self.filter_by_angle(
+                mask_black_raw, min_area=300, max_area=8000,
+                min_angle=25.0, max_angle=65.0
+            )
 
-            if abs(turn_deg) < 2:
-                self.send_command(f"G{self.current_speed}")
+            # ── 횡단보도 제거 ──
+            mask_black, removed_rows = self.remove_crosswalk(mask_black_filtered)
+            self.crosswalk_detected  = (removed_rows > roi_h * 0.3)
+            combined_mask = cv2.bitwise_or(mask_yellow, mask_black)
+
+            # ── 차선 중심 검출 ──
+            m_left  = cv2.moments(combined_mask[:, :roi_w//2])
+            m_right = cv2.moments(combined_mask[:, roi_w//2:])
+            cx_left  = int(m_left['m10']  / m_left['m00'])             if m_left['m00']  > 0 else -1
+            cx_right = int(m_right['m10'] / m_right['m00']) + roi_w//2 if m_right['m00'] > 0 else -1
+            if cx_left != -1 and cx_right != -1:
+                self.lane_width = cx_right - cx_left
+
+            red_line_detected    = cv2.countNonZero(mask_red)    > 5000
+            yellow_line_detected = cv2.countNonZero(mask_yellow) > 5000
+
+            # ── 회피 방향 계산 ──
+            # 노란 차선이 있는 쪽의 반대로 회피
+            # 노란 차선이 왼쪽에 많으면 → 오른쪽(+1)으로 회피
+            # 노란 차선이 오른쪽에 많으면 → 왼쪽(-1)으로 회피
+            yellow_left  = cv2.countNonZero(mask_yellow[:, :roi_w//2])
+            yellow_right = cv2.countNonZero(mask_yellow[:, roi_w//2:])
+            if yellow_left > yellow_right:
+                avoid_direction = 1    # 노란선이 왼쪽 → 오른쪽으로 회피
             else:
-                self.send_command(f"T{turn_deg}")
+                avoid_direction = -1   # 노란선이 오른쪽 → 왼쪽으로 회피
+
+            # ── 조향 목표 계산 ──
+            if self.crosswalk_detected:
+                target_x = self.last_valid_target_x
+            else:
+                if cx_left != -1 and cx_right != -1:
+                    target_x = (cx_left + cx_right) // 2
+                elif cx_left != -1:
+                    target_x = cx_left + (self.lane_width // 2)
+                elif cx_right != -1:
+                    target_x = cx_right - (self.lane_width // 2)
+                else:
+                    target_x = roi_w // 2
+                self.last_valid_target_x = target_x
+
+            error = (roi_w / 2) - target_x
+
+            # ── 제어 노드로 전송 ──
+            # 포맷: error | red_line | crosswalk | yellow_line | avoid_direction
+            status_msg = String()
+            status_msg.data = (
+                f"{error}|{1 if red_line_detected else 0}|"
+                f"{1 if self.crosswalk_detected else 0}|"
+                f"{1 if yellow_line_detected else 0}|"
+                f"{avoid_direction}"
+            )
+            self.vision_pub.publish(status_msg)
+
+            # ── 디버그 시각화 ──
+            overlay = roi.copy()
+            cv2.polylines(overlay, [roi_vertices], isClosed=True, color=(255, 0, 0), thickness=2)
+
+            overlay[mask_yellow > 0] = (0, 220, 220)
+            overlay[mask_black  > 0] = (0, 255, 0)
+            overlay[mask_red    > 0] = (0, 0, 255)
+
+            shadow_removed = cv2.bitwise_and(
+                mask_black_raw, cv2.bitwise_not(mask_black_filtered))
+            overlay[shadow_removed > 0] = (0, 128, 255)
+
+            crosswalk_removed = cv2.bitwise_and(
+                mask_black_filtered, cv2.bitwise_not(mask_black))
+            overlay[crosswalk_removed > 0] = (180, 80, 255)
+
+            draw_y = int(roi_h * 0.8)
+            if cx_left  != -1: cv2.circle(overlay, (cx_left,  draw_y), 8,  (255, 0, 255), -1)
+            if cx_right != -1: cv2.circle(overlay, (cx_right, draw_y), 8,  (255, 0, 255), -1)
+            cv2.circle(overlay, (target_x, draw_y), 12, (0, 0, 255), -1)
+            cv2.line(overlay, (roi_w//2, 0), (roi_w//2, roi_h), (180, 180, 180), 1)
+
+            state_color = {"CRUISE": (255,255,255), "AVOID": (0,165,255), "STOP_TIMER": (0,0,255)}
+            status_text = f"State:{self.current_control_state}"
+            if self.crosswalk_detected:
+                status_text += " [CROSSWALK]"
+
+            cv2.putText(overlay, status_text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        state_color.get(self.current_control_state, (255,255,255)), 2)
+            cv2.putText(overlay, f"Cmd:{self.last_sent_cmd}", (10, 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(overlay, f"RED:{'ON' if red_line_detected else 'off'}", (10, 64),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 0, 255) if red_line_detected else (100, 100, 100), 1)
+            # 회피 방향 디버그 표시
+            avoid_text  = "AVOID: RIGHT(+1)" if avoid_direction == 1 else "AVOID: LEFT(-1)"
+            avoid_color = (0, 220, 220) if avoid_direction == 1 else (255, 100, 100)
+            cv2.putText(overlay, avoid_text, (10, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.5, avoid_color, 1)
+
+            def make_mask_vis(m, color, label):
+                vis = np.zeros((m.shape[0], m.shape[1], 3), dtype=np.uint8)
+                vis[m > 0] = color
+                cv2.putText(vis, label, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                return vis
+
+            cell_w, cell_h = roi_w // 4, int(roi_h * 0.4)
+            m_y = cv2.resize(make_mask_vis(mask_yellow,    (0, 220, 220), "YELLOW"), (cell_w, cell_h))
+            m_b = cv2.resize(make_mask_vis(mask_black,     (0, 255, 0),   "BLACK"),  (cell_w, cell_h))
+            m_s = cv2.resize(make_mask_vis(shadow_removed, (0, 128, 255), "SHADOW"), (cell_w, cell_h))
+            m_r = cv2.resize(make_mask_vis(mask_red,       (0, 0, 255),   "RED"),    (roi_w - cell_w*3, cell_h))
+
+            mask_row    = cv2.resize(np.hstack([m_y, m_b, m_s, m_r]), (roi_w, cell_h))
+            debug_final = np.vstack([overlay, mask_row])
+
+            compressed_msg = CompressedImage()
+            compressed_msg.header.stamp    = self.get_clock().now().to_msg()
+            compressed_msg.header.frame_id = "camera_frame"
+            compressed_msg.format          = "jpeg"
+            compressed_msg.data            = cv2.imencode('.jpg', debug_final)[1].tobytes()
+            self.image_pub.publish(compressed_msg)
+
+        except Exception as e:
+            self.get_logger().error(f'image_callback 오류: {e}')
+            import traceback
+            traceback.print_exc()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ControlHandler()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    node = VisionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
