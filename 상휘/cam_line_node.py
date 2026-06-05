@@ -47,11 +47,28 @@ class VisionNode(Node):
         self.prev_right_top = None
         self.prev_right_bot = None
 
-        self.prev_avoid_direction = -1
+        # ── 차선 상태 관리 ──
+        # 0: 미결정, 1: 1차선(노란=왼쪽, 검은=오른쪽), 2: 2차선(노란=오른쪽, 검은=왼쪽)
+        self.current_lane = 0
 
     def state_callback(self, msg):
         try:
-            self.current_control_state, self.last_sent_cmd = msg.data.split('|')
+            state_part, self.last_sent_cmd = msg.data.split('|')
+            self.current_control_state = state_part
+
+            # control_handler에서 장애물 회피 완료 시 "LANE_CHANGE:1" 또는 "LANE_CHANGE:2" 전송
+            if "LANE_CHANGE:" in state_part:
+                try:
+                    new_lane = int(state_part.split("LANE_CHANGE:")[1].strip())
+                    self.current_lane = new_lane
+                    # 차선 변경 시 이전 좌표 초기화
+                    self.prev_left_top  = None
+                    self.prev_left_bot  = None
+                    self.prev_right_top = None
+                    self.prev_right_bot = None
+                    self.get_logger().info(f"차선 변경 수신 → current_lane = {self.current_lane}")
+                except Exception:
+                    pass
         except ValueError:
             pass
 
@@ -76,33 +93,17 @@ class VisionNode(Node):
         return result
 
     def extract_black_lane(self, roi):
-        """
-        CLAHE로 대비 향상 → adaptiveThreshold로 어두운 영역 추출
-        단순 HSV 마스킹 대신 조명 변화에 강인한 방식
-        """
-        # 1. 그레이스케일 변환
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-        # 2. CLAHE로 대비 향상 (조명 불균일 보정)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         gray_clahe = clahe.apply(gray)
-
-        # 3. adaptiveThreshold로 어두운 영역 추출
-        # ADAPTIVE_THRESH_GAUSSIAN_C: 주변 픽셀 가중 평균 기준
-        # THRESH_BINARY_INV: 어두운 부분 = 흰색(255)
         adaptive = cv2.adaptiveThreshold(
-            gray_clahe,
-            255,
+            gray_clahe, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV,
-            blockSize=31,   # 주변 참조 영역 크기 (홀수) — 클수록 넓은 영역 기준
-            C=10            # 임계값 보정값 — 클수록 더 어두운 것만 추출
+            blockSize=31, C=8
         )
-
-        # 4. 노이즈 제거 (작은 점 제거)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_OPEN, kernel)
-
         return adaptive, gray_clahe
 
     def fit_line(self, points, roi_h):
@@ -163,74 +164,103 @@ class VisionNode(Node):
             cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
             roi_h, roi_w = cv_image.shape[:2]
 
-            # ── 1. ROI 다각형 1채널 마스크 생성 ──
+            # ── 1. ROI 다각형 마스크 ──
             roi_vertices = np.array([[
                 (0,   500),
                 (100, 200),
                 (540, 200),
                 (640, 500)
             ]], dtype=np.int32)
-            
-            # 흑백(1채널) 마스크 생성 (AND 연산용)
+
             poly_mask_1ch = np.zeros((roi_h, roi_w), dtype=np.uint8)
             cv2.fillPoly(poly_mask_1ch, roi_vertices, 255)
 
-            # 디버그 시각화 및 기존 변수 호환을 위한 roi 이미지 생성
             roi = cv2.bitwise_and(cv_image, cv_image, mask=poly_mask_1ch)
 
-            # ── 2. 색공간 변환 (인공적인 검은 여백이 없는 원본 사용!) ──
+            # ── 2. 색공간 변환 ──
             hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
 
             if self.last_valid_target_x is None:
                 self.last_valid_target_x = roi_w // 2
 
-            # ── 3. 색상 추출 후 ROI 마스크 적용 ──
-            # 노란선
+            # ── 3. 색상 마스킹 + ROI 적용 ──
             mask_yellow_raw = cv2.inRange(hsv, np.array([20,  65, 120]), np.array([41, 255, 255]))
-            mask_yellow = cv2.bitwise_and(mask_yellow_raw, poly_mask_1ch)
+            mask_yellow     = cv2.bitwise_and(mask_yellow_raw, poly_mask_1ch)
 
-            # 빨간선
             mask_red_raw = cv2.bitwise_or(
                 cv2.inRange(hsv, np.array([0,   30,  49]), np.array([12,  255, 255])),
                 cv2.inRange(hsv, np.array([170, 120,  70]), np.array([180, 255, 255]))
             )
             mask_red = cv2.bitwise_and(mask_red_raw, poly_mask_1ch)
 
-            # 검은선: 원본(cv_image)을 넘겨서 외곽선 왜곡을 방지한 뒤, 마지막에 ROI 적용
             mask_black_raw_unmasked, gray_clahe = self.extract_black_lane(cv_image)
             mask_black_raw = cv2.bitwise_and(mask_black_raw_unmasked, poly_mask_1ch)
 
-            # ── 4. 각도 필터로 그림자 제거 (이후 코드는 기존과 동일) ──
+            # ── 4. 각도 필터 (그림자 제거) ──
             mask_black = self.filter_by_angle(
                 mask_black_raw, min_area=300, max_area=8000,
                 min_angle=25.0, max_angle=65.0
             )
-            
-            # ... (이하 avoid_direction 계산 로직 동일) ...
 
-            # ── avoid_direction 계산 ──
+            # ── 5. 횡단보도 감지 ──
+            contours_black, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_black_lines  = sum(1 for cnt in contours_black if cv2.contourArea(cnt) > 400)
+            is_crosswalk = valid_black_lines >= 3
+            if is_crosswalk:
+                mask_black = np.zeros_like(mask_black)
+
+            # ── 6. 노란선 위치 파악 ──
             yellow_left  = cv2.countNonZero(mask_yellow[:, :roi_w//2])
             yellow_right = cv2.countNonZero(mask_yellow[:, roi_w//2:])
             yellow_total = yellow_left + yellow_right
 
-            if yellow_total == 0:
-                avoid_direction = self.prev_avoid_direction
-                mask_left_lane  = mask_black
-                mask_right_lane = mask_black
-            elif yellow_left > yellow_right:
-                avoid_direction = 1
-                self.prev_avoid_direction = avoid_direction
-                mask_black[:, :roi_w//2] = 0   # 왼쪽 검은선 제거
-                mask_left_lane  = mask_yellow
-                mask_right_lane = mask_black
-            else:
-                avoid_direction = -1
-                self.prev_avoid_direction = avoid_direction
-                mask_black[:, roi_w//2:] = 0   # 오른쪽 검은선 제거
-                mask_left_lane  = mask_black
-                mask_right_lane = mask_yellow
+            # ── 7. 처음 출발 시 차선 결정 ──
+            if self.current_lane == 0 and yellow_total > 500:
+                if yellow_left > yellow_right:
+                    self.current_lane = 1
+                else:
+                    self.current_lane = 2
+                self.get_logger().info(f"초기 차선 결정: {self.current_lane}차선")
 
-            # ── 차선 검출 ──
+            # ── 8. 차선에 따라 마스크 영역 제한 및 역할 배정 ──
+            if self.current_lane == 1:
+                # 1차선: 노란선=왼쪽, 검은선=오른쪽
+                # 오른쪽 노란선 / 왼쪽 검은선 무시
+                mask_yellow_lane        = mask_yellow.copy()
+                mask_yellow_lane[:, roi_w//2:] = 0
+                mask_black_lane         = mask_black.copy()
+                mask_black_lane[:, :roi_w//2]  = 0
+                avoid_direction = 1             # 1차선 → 오른쪽으로 회피
+                mask_left_lane  = mask_yellow_lane
+                mask_right_lane = mask_black_lane
+
+            elif self.current_lane == 2:
+                # 2차선: 노란선=오른쪽, 검은선=왼쪽
+                # 왼쪽 노란선 / 오른쪽 검은선 무시
+                mask_yellow_lane        = mask_yellow.copy()
+                mask_yellow_lane[:, :roi_w//2] = 0
+                mask_black_lane         = mask_black.copy()
+                mask_black_lane[:, roi_w//2:]  = 0
+                avoid_direction = -1            # 2차선 → 왼쪽으로 회피
+                mask_left_lane  = mask_black_lane
+                mask_right_lane = mask_yellow_lane
+
+            else:
+                # 차선 미결정 → 노란선 위치로 임시 판단
+                mask_yellow_lane = mask_yellow.copy()
+                mask_black_lane  = mask_black.copy()
+                if yellow_left > yellow_right:
+                    avoid_direction = 1
+                    mask_black_lane[:, :roi_w//2] = 0
+                    mask_left_lane  = mask_yellow_lane
+                    mask_right_lane = mask_black_lane
+                else:
+                    avoid_direction = -1
+                    mask_black_lane[:, roi_w//2:] = 0
+                    mask_left_lane  = mask_black_lane
+                    mask_right_lane = mask_yellow_lane
+
+            # ── 9. 차선 검출 ──
             left_top,  left_bot  = self.detect_single_lane(mask_left_lane,  roi_w, roi_h, 'left')
             right_top, right_bot = self.detect_single_lane(mask_right_lane, roi_w, roi_h, 'right')
 
@@ -260,7 +290,7 @@ class VisionNode(Node):
                 left_bot  = right_bot - self.lane_width
                 left_top  = right_top - self.lane_width
 
-            # ── 차선 중앙 계산 ──
+            # ── 10. 차선 중앙 계산 ──
             if left_bot != -1 and right_bot != -1:
                 center_bot = (left_bot  + right_bot) // 2
                 center_top = (left_top  + right_top) // 2
@@ -274,7 +304,7 @@ class VisionNode(Node):
             red_line_detected    = cv2.countNonZero(mask_red)    > 5000
             yellow_line_detected = yellow_total > 5000
 
-            # ── vision_status 퍼블리시 ──
+            # ── 11. vision_status 퍼블리시 ──
             status_msg = String()
             status_msg.data = (
                 f"{error}|{1 if red_line_detected else 0}|"
@@ -284,9 +314,13 @@ class VisionNode(Node):
             )
             self.vision_pub.publish(status_msg)
 
-            # ── 디버그 시각화 ──
+            # ── 12. 디버그 시각화 ──
             overlay = roi.copy()
             cv2.polylines(overlay, [roi_vertices], isClosed=True, color=(255, 0, 0), thickness=2)
+
+            if is_crosswalk:
+                cv2.putText(overlay, "CROSSWALK DETECTED!", (roi_w//2 - 120, 140),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 100, 255), 2)
 
             overlay[mask_yellow > 0] = (0, 220, 220)
             overlay[mask_black  > 0] = (0, 255, 0)
@@ -323,16 +357,20 @@ class VisionNode(Node):
             cv2.putText(overlay, f"RED:{'ON' if red_line_detected else 'off'}", (10, 64),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (0, 0, 255) if red_line_detected else (100, 100, 100), 1)
-            avoid_text  = "AVOID:RIGHT(+1)" if avoid_direction == 1 else "AVOID:LEFT(-1)"
-            avoid_color = (0, 220, 220) if avoid_direction == 1 else (255, 100, 100)
-            cv2.putText(overlay, avoid_text, (10, 84),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, avoid_color, 1)
-            cv2.putText(overlay,
-                        f"L:{'YELLOW' if avoid_direction==1 else 'BLACK'}  "
-                        f"R:{'BLACK' if avoid_direction==1 else 'YELLOW'}",
-                        (10, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
-            # 하단 디버그 — CLAHE 결과도 표시
+            # 현재 차선 + 회피 방향 표시
+            lane_label = f"LANE:{self.current_lane if self.current_lane != 0 else '?'}"
+            lane_color = (0, 220, 220) if self.current_lane == 1 else (255, 100, 100)
+            cv2.putText(overlay, lane_label, (10, 84),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, lane_color, 2)
+            avoid_text  = "AVOID:RIGHT(+1)" if avoid_direction == 1 else "AVOID:LEFT(-1)"
+            cv2.putText(overlay, avoid_text, (10, 104),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, lane_color, 1)
+            cv2.putText(overlay,
+                        f"L:{'YELLOW' if self.current_lane==1 else 'BLACK'}  "
+                        f"R:{'BLACK'  if self.current_lane==1 else 'YELLOW'}",
+                        (10, 124), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
+
             def make_mask_vis(m, color, label):
                 vis = np.zeros((m.shape[0], m.shape[1], 3), dtype=np.uint8)
                 vis[m > 0] = color
@@ -340,11 +378,11 @@ class VisionNode(Node):
                 return vis
 
             cell_w, cell_h = roi_w // 4, int(roi_h * 0.4)
-            m_y  = cv2.resize(make_mask_vis(mask_yellow,    (0, 220, 220), "YELLOW"),   (cell_w, cell_h))
-            m_b  = cv2.resize(make_mask_vis(mask_black,     (0, 255, 0),   "BLACK"),    (cell_w, cell_h))
-            m_cl = cv2.resize(cv2.cvtColor(gray_clahe, cv2.COLOR_GRAY2BGR),             (cell_w, cell_h))
+            m_y  = cv2.resize(make_mask_vis(mask_yellow, (0, 220, 220), "YELLOW"),   (cell_w, cell_h))
+            m_b  = cv2.resize(make_mask_vis(mask_black,  (0, 255, 0),   "BLACK"),    (cell_w, cell_h))
+            m_cl = cv2.resize(cv2.cvtColor(gray_clahe, cv2.COLOR_GRAY2BGR),          (cell_w, cell_h))
             cv2.putText(m_cl, "CLAHE", (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            m_r  = cv2.resize(make_mask_vis(mask_red,       (0, 0, 255),   "RED"),      (roi_w - cell_w*3, cell_h))
+            m_r  = cv2.resize(make_mask_vis(mask_red,    (0, 0, 255),   "RED"),      (roi_w - cell_w*3, cell_h))
 
             mask_row    = cv2.resize(np.hstack([m_y, m_b, m_cl, m_r]), (roi_w, cell_h))
             debug_final = np.vstack([overlay, mask_row])
