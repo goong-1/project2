@@ -29,6 +29,7 @@ class ControlHandler(Node):
         self.avoid_direction   = 0
         self.avoid_substate    = 0
         self.waiting_for_esp   = False
+        self.wait_start_time   = 0.0  # [추가] DONE 대기 시작 시간
         self.current_speed     = 115
 
         # PID 파라미터
@@ -118,6 +119,7 @@ class ControlHandler(Node):
             # T, S 만 DONE 대기 / G 는 즉시 다음 명령 허용
             if cmd_str.startswith("T") or cmd_str == "S":
                 self.waiting_for_esp = True
+                self.wait_start_time = time.time()
             else:
                 self.waiting_for_esp = False
 
@@ -157,7 +159,15 @@ class ControlHandler(Node):
             self.red_line_latched = False
 
         current_time = time.time()
-
+        
+        if self.waiting_for_esp and (current_time - self.wait_start_time > 0.5):
+            self.get_logger().warn("ESP32 응답 시간 초과 (0.5초). 다음 명령으로 넘어갑니다.")
+            self.waiting_for_esp = False
+            self.last_command = ""
+            self.prev_error = 0.0  # PID 리셋 (DONE을 받았을 때와 동일하게 처리)
+            self.integral = 0.0
+            self.prev_time = current_time
+            
         # ── 상태 전환 ──
         if self.state == "CRUISE" and not crosswalk_detected:
             if red_line_detected and not self.red_line_latched:
@@ -235,7 +245,7 @@ class ControlHandler(Node):
             turn_deg = int(pid_output)
             turn_deg = max(-5, min(5, turn_deg))
 
-            if abs(error) < 30 or turn_deg == 0:
+            if abs(error) < 30 or turn_deg < 2:
                 self.send_command(f"G{self.current_speed}")
             else:
                 self.send_command(f"T{turn_deg}")
