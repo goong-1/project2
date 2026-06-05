@@ -25,7 +25,8 @@ class ControlHandler(Node):
         self.state             = "CRUISE"
         self.last_command      = ""
         self.stop_start_time   = 0.0
-        self.red_line_latched  = False
+        self.red_line_seen     = False  # 수정된 부분: 빨간 선 감지 여부
+        self.red_line_lost_time= 0.0    # 수정된 부분: 빨간 선이 사라진 시간
         self.avoid_direction   = 0
         self.avoid_substate    = 0
         self.waiting_for_esp   = False
@@ -155,10 +156,14 @@ class ControlHandler(Node):
         except (ValueError, IndexError):
             return
 
-        if not red_line_detected:
-            self.red_line_latched = False
-
         current_time = time.time()
+
+        # 수정된 부분: 빨간 선이 보였다가 사라지는 시점을 추적
+        if red_line_detected:
+            self.red_line_seen = True
+            self.red_line_lost_time = 0.0
+        elif self.red_line_seen and self.red_line_lost_time == 0.0:
+            self.red_line_lost_time = current_time
         
         if self.waiting_for_esp and (current_time - self.wait_start_time > 0.5):
             self.get_logger().warn("ESP32 응답 시간 초과 (0.5초). 다음 명령으로 넘어갑니다.")
@@ -170,10 +175,13 @@ class ControlHandler(Node):
             
         # ── 상태 전환 ──
         if self.state == "CRUISE" and not crosswalk_detected:
-            if red_line_detected and not self.red_line_latched:
-                self.state            = "STOP_TIMER"
-                self.stop_start_time  = current_time
-                self.red_line_latched = True
+            # 수정된 부분: 빨간 선이 보였다가 사라진 후 0.1초가 지나면 정지 모드로 전환
+            if self.red_line_seen and not red_line_detected:
+                if current_time - self.red_line_lost_time >= 0.1:
+                    self.state              = "STOP_TIMER"
+                    self.stop_start_time    = current_time
+                    self.red_line_seen      = False
+                    self.red_line_lost_time = 0.0
 
         # ── 명령 실행 ──
         if crosswalk_detected and self.state != "AVOID":
