@@ -1,124 +1,174 @@
-import os
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 import time
+import threading
+import sys
+import tty
+import termios
 
-os.environ['ROS_DOMAIN_ID'] = '30'
 
 class ControlHandler(Node):
+
     def __init__(self):
         super().__init__('control_handler')
-        # 비전 노드 정보 구독 (원본 유지)
+
         self.vision_sub = self.create_subscription(String, '/vision_status', self.vision_callback, 10)
-        
-
-        # Virtual ESP32 토픽 통신 (원본 유지)
         self.status_sub = self.create_subscription(String, '/esp_status', self.status_callback, 10)
-        self.publisher = self.create_publisher(String, '/esp_command', 10)
+        self.publisher  = self.create_publisher(String, '/esp_command', 10)
+        self.state_pub  = self.create_publisher(String, '/control_state', 10)
 
-        # 비전 창 업데이트용 상태 퍼블리셔 (원본 유지)
-        self.state_pub = self.create_publisher(String, '/control_state', 10)
-
-        # ★ [원본 유지] 0.2초 주기로 마지막 명령을 지속 전송하는 타이머 (ESP32 타임아웃 방지)
         self.transmit_interval = 0.2
         self.transmit_timer = self.create_timer(self.transmit_interval, self.timer_fallback_transmit)
 
-        # FSM 변수 (원본 유지)
-        self.state = "CRUISE"
-        self.last_command = ""
-        self.stop_start_time = 0.0
-        self.red_line_latched = False
-        self.obstacle_latched = False
-        self.avoid_direction = 0
-        self.avoid_substate = 0
-        self.waiting_for_esp = False
-        
-        # 기본 직진 속도 설정 (요청 반영)
-        self.current_speed = 115
+        # FSM 변수
+        self.state             = "CRUISE"
+        self.last_command      = ""
+        self.stop_start_time   = 0.0
+        self.red_line_latched  = False
+        self.avoid_direction   = 0
+        self.avoid_substate    = 0
+        self.waiting_for_esp   = False
+        self.current_speed     = 115
 
+        # PID 파라미터
+        self.kp = 0.02
+        self.ki = 0.001
+        self.kd = 0.0
 
+        self.prev_error = 0.0
+        self.integral   = 0.0
+        self.prev_time  = time.time()
+
+        # 긴급 정지 플래그
+        self.emergency_stop = False
+
+        # 키보드 입력 스레드
+        self.kb_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+        self.kb_thread.start()
+        self.get_logger().info("키보드 리스너 시작 — 's' 키: 긴급 정지 / 'r' 키: 재개")
+
+    # ─────────────────────────────────────────────
+    # 키보드 리스너
+    # ─────────────────────────────────────────────
+    def _keyboard_listener(self):
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while True:
+                ch = sys.stdin.read(1)
+                if ch == 's':
+                    self.emergency_stop = True
+                    self.get_logger().warn("긴급 정지 활성화 (재개: 'r')")
+                    self._force_stop()
+                elif ch == 'r':
+                    self.emergency_stop  = False
+                    self.last_command    = ""
+                    self.waiting_for_esp = False
+                    self.prev_error      = 0.0
+                    self.integral        = 0.0
+                    self.prev_time       = time.time()
+                    self.get_logger().info("긴급 정지 해제 — 주행 재개")
+                elif ch == '\x03':  # Ctrl+C
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _force_stop(self):
+        msg      = String()
+        msg.data = "S"
+        self.publisher.publish(msg)
+        self.last_command = "S"
+
+    # ─────────────────────────────────────────────
+    # ESP32 통신
+    # ─────────────────────────────────────────────
     def status_callback(self, msg):
         if msg.data == "DONE":
             self.waiting_for_esp = False
-            self.last_command = ""
-            self.current_speed = 115  # 작업 완료 후 직진 속도를 다시 기본(115)으로 복구
+            self.last_command    = ""
+            self.prev_error      = 0.0   # DONE 수신 시 PID 리셋
+            self.integral        = 0.0
             self.get_logger().info("ESP32 작업 완료 신호(DONE) 접수.")
 
-    # ★ [원본 유지] 하드웨어 멈춤 방지용 백그라운드 송신 함수
     def timer_fallback_transmit(self):
-        """ 타이머에 의해 0.2초마다 마지막 명령을 반복 전송하여 하드웨어 정지 방지 """
+        if self.emergency_stop:
+            self._force_stop()
+            return
         if self.last_command:
-            msg = String()
+            msg      = String()
             msg.data = self.last_command
             self.publisher.publish(msg)
 
     def send_command(self, cmd_str):
-        # [수정] ESP 피드백(DONE)을 대기 중일 때, '새로운 명령'으로의 변경은 차단하되 
-        # 타이머가 공급하는 '기존 마지막 명령'의 반복 전송은 허용하도록 필터링 최적화
+        if self.emergency_stop:
+            return
+
         if self.waiting_for_esp and cmd_str != self.last_command:
             return
 
         if cmd_str != self.last_command:
-            msg = String()
+            msg      = String()
             msg.data = cmd_str
             self.publisher.publish(msg)
             self.last_command = cmd_str
             self.get_logger().info(f"Sent to ESP32: {cmd_str}")
-            
-            # 회전(T)이나 정지(S) 명령이 '처음' 나갔을 때만 대기 상태(Lock) 활성화
+
+            # T, S 만 DONE 대기 / G 는 즉시 다음 명령 허용
             if cmd_str.startswith("T") or cmd_str == "S":
                 self.waiting_for_esp = True
+            else:
+                self.waiting_for_esp = False
 
-        # ★ 0.2초 타이머 백그라운드 송신에 의해 동일한 명령(cmd_str == self.last_command)이 
-        # 계속 들어올 때는, 위 조건문을 거치지 않고 이 분기를 통해 하드웨어로 명령이 계속 쏘아집니다.
         elif cmd_str == self.last_command and self.waiting_for_esp:
-            msg = String()
+            msg      = String()
             msg.data = cmd_str
             self.publisher.publish(msg)
 
-        # 비전 노드로 상태 송신 (원본 유지)
         state_msg = String()
-        display_state = f"{self.state} Step{self.avoid_substate}" if self.state == "AVOID" else self.state
+        display_state = (
+            f"{self.state} Step{self.avoid_substate}"
+            if self.state == "AVOID" else self.state
+        )
         if self.waiting_for_esp: display_state += " [WAIT]"
+        if self.emergency_stop:  display_state += " [E-STOP]"
         state_msg.data = f"{display_state}|{self.last_command}"
         self.state_pub.publish(state_msg)
 
+    # ─────────────────────────────────────────────
+    # 비전 콜백 + FSM
+    # ─────────────────────────────────────────────
     def vision_callback(self, msg):
-        # 데이터 언팩 (에러값|정지선|장애물전방|횡단보도|회피방향|장애물자체|노란선여부) 
+        if self.emergency_stop:
+            return
+
         try:
-            data = msg.data.split('|')
-            error = float(data[0])
-            red_line_detected = bool(int(data[1]))
-            obstacle_in_front = bool(int(data[2]))
-            crosswalk_detected = bool(int(data[3]))
-            avoid_dir = int(data[4])
-            obstacle_detected = bool(int(data[5]))
-            yellow_line_detected = bool(int(data[6])) 
+            data                 = msg.data.split('|')
+            error                = float(data[0])
+            red_line_detected    = bool(int(data[1]))
+            crosswalk_detected   = bool(int(data[2]))
+            yellow_line_detected = bool(int(data[3]))
+            avoid_direction      = int(data[4])
         except (ValueError, IndexError):
             return
 
-        # 래치 해제 (원본 유지)
-        if not red_line_detected: self.red_line_latched = False
-        if not obstacle_detected: self.obstacle_latched = False
+        if not red_line_detected:
+            self.red_line_latched = False
 
         current_time = time.time()
 
-        # FSM 상태 전환 (원본 유지)
+        # ── 상태 전환 ──
         if self.state == "CRUISE" and not crosswalk_detected:
             if red_line_detected and not self.red_line_latched:
-                self.state = "STOP_TIMER"
-                self.stop_start_time = current_time
+                self.state            = "STOP_TIMER"
+                self.stop_start_time  = current_time
                 self.red_line_latched = True
-            elif obstacle_in_front and not self.obstacle_latched:
-                self.state = "AVOID"
-                self.avoid_substate = 1
-                self.waiting_for_esp = False
-                self.avoid_direction = avoid_dir
 
-        # FSM 명령 실행 (원본 유지 및 속도 변수 적용)
+        # ── 명령 실행 ──
         if crosswalk_detected and self.state != "AVOID":
-            self.last_command = ""
+            self.last_command    = ""
+            self.waiting_for_esp = False
             self.send_command(f"G{self.current_speed}")
 
         elif self.state == "STOP_TIMER":
@@ -128,43 +178,68 @@ class ControlHandler(Node):
                 self.send_command("S")
 
         elif self.state == "AVOID":
-            # [Step 1] 45도 회전 시작 (원본 유지)
             if self.avoid_substate == 1:
                 if not self.waiting_for_esp:
+                    self.avoid_direction = avoid_direction
                     self.send_command(f"T{45 * self.avoid_direction}")
-                    self.avoid_substate = 2      
+                    self.avoid_substate  = 2
 
-            # [Step 2] 회전 완료 대기 후 -> 우회 직진 (원본 유지 및 속도 변수 적용)
             elif self.avoid_substate == 2:
                 if self.waiting_for_esp:
+                    # 회전 완료 대기 중 — 반복 전송
+                    self.send_command(f"T{45 * self.avoid_direction}")
                     return
-
                 if not getattr(self, 'g_cmd_sent', False):
                     self.send_command(f"G{self.current_speed}")
                     self.g_cmd_sent = True
-
                 if yellow_line_detected:
                     self.avoid_substate = 3
-                    self.g_cmd_sent = False 
+                    self.g_cmd_sent     = False
 
-            # [Step 3] 다시 원래 차선으로 45도 복귀 회전 (원본 유지)
             elif self.avoid_substate == 3:
                 if not self.waiting_for_esp:
                     self.send_command(f"T{-45 * self.avoid_direction}")
                     self.avoid_substate = 4
 
-            # [Step 4] 일반 주행 모드로 복귀 (원본 유지)
             elif self.avoid_substate == 4:
-                if not self.waiting_for_esp:
-                    self.state = "CRUISE"
-                    self.avoid_substate = 1
+                if self.waiting_for_esp:
+                    self.send_command(f"T{-45 * self.avoid_direction}")
+                    return
+                # 복귀 완료
+                self.state          = "CRUISE"
+                self.avoid_substate = 1
+                self.prev_error     = 0.0
+                self.integral       = 0.0
+                self.prev_time      = time.time()
 
         elif self.state == "CRUISE":
-            if abs(error) < 10:
+            # ── PID 제어 ──
+            # waiting_for_esp 중이면 PID 스킵 (T 명령 완료 대기)
+            if self.waiting_for_esp:
+                return
+
+            now = time.time()
+            dt  = now - self.prev_time
+            if dt <= 0:
+                dt = 0.01
+
+            self.integral += error * dt
+            self.integral  = max(-500.0, min(500.0, self.integral))
+
+            derivative = (error - self.prev_error) / dt
+            pid_output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+
+            self.prev_error = error
+            self.prev_time  = now
+
+            turn_deg = int(pid_output)
+            turn_deg = max(-5, min(5, turn_deg))
+
+            if abs(error) < 30 or turn_deg == 0:
                 self.send_command(f"G{self.current_speed}")
             else:
-                turn_deg = int(error * -0.1)
-                self.send_command(f"T{turn_deg}" if abs(turn_deg) >= 2 else f"G{self.current_speed}")
+                self.send_command(f"T{turn_deg}")
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -172,6 +247,7 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
