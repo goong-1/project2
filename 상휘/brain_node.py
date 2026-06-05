@@ -245,7 +245,7 @@ class ControlHandler(Node):
             self.integral  = max(-500.0, min(500.0, self.integral))
 
             derivative = (error - self.prev_error) / dt
-            pid_output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+            pid_output = -((self.kp * error) + (self.ki * self.integral) + (self.kd * derivative))
 
             self.prev_error = error
             self.prev_time  = now
@@ -253,7 +253,7 @@ class ControlHandler(Node):
             turn_deg = int(pid_output)
             turn_deg = max(-5, min(5, turn_deg))
 
-            if abs(error) < 30 or turn_deg < 2:
+            if abs(error) < 30 or turn_deg < 1:
                 self.send_command(f"G{self.current_speed}")
             else:
                 self.send_command(f"T{turn_deg}")
