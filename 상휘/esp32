@@ -1,0 +1,152 @@
+#include <WiFi.h>
+#include <ArduinoWebsockets.h>
+
+const char* ssid = "asia-edu_2G";
+const char* password = "12345678";
+const String robot_name = "robot_0"; 
+
+const char* websockets_server_host = "[내 PC의 IP]";    
+const uint16_t websockets_server_port = 9090; 
+
+using namespace websockets;
+WebsocketsClient client;
+
+char serialBuffer[256];
+int bufferIndex = 0;
+unsigned long lastSerialReadTime = 0;
+
+volatile bool hasNewCmd = false;
+volatile char nextCmd = 'x';
+char lastSentCmd = 'y'; // 초기값 설정
+
+void onMessageCallback(WebsocketsMessage message) {
+  if (message.isText()) {
+    String payload = message.data();
+    
+    if (payload.indexOf(robot_name) != -1 && payload.indexOf("cmd_vel") != -1) {
+      char command = 'x'; // 기본값 정지
+
+      // 1. [회전 정밀 검사] angular 객체 내부의 z 값 추출
+      int angularIdx = payload.indexOf("angular");
+      bool isRotation = false;
+
+      if (angularIdx != -1) {
+        int zIdx = payload.indexOf("z", angularIdx);
+        if (zIdx != -1) {
+          int colonIdx = payload.indexOf(":", zIdx);
+          if (colonIdx != -1) {
+            // 💡 콜론(:) 뒤에서 가장 먼저 나오는 콤마(,) 또는 중괄호(})의 위치를 찾습니다.
+            int endIdx = payload.length();
+            int commaIdx = payload.indexOf(",", colonIdx);
+            int braceIdx = payload.indexOf("}", colonIdx);
+            if (commaIdx != -1 && commaIdx < endIdx) endIdx = commaIdx;
+            if (braceIdx != -1 && braceIdx < endIdx) endIdx = braceIdx;
+
+            // 순수한 데이터 알맹이만 컷 (예: " 1.0" 또는 " -1.0")
+            String zValue = payload.substring(colonIdx + 1, endIdx);
+            zValue.trim(); // 앞뒤 모든 공백 원천 차단
+            zValue.replace("\"", ""); // 혹시 모를 따옴표 제거
+
+            if (zValue.indexOf("-") != -1) {
+              command = 'd'; // 우회전
+              isRotation = true;
+            } 
+            else if (zValue != "0.0" && zValue != "0" && zValue != "0.") {
+              command = 'a'; // 좌회전
+              isRotation = true;
+            }
+          }
+        }
+      }
+
+      // 2. [전/후진 정밀 검사] 회전이 아닐 때만 linear의 x 값 추출
+      if (!isRotation) {
+        int xIdx = payload.indexOf("x");
+        if (xIdx != -1) {
+          int colonIdx = payload.indexOf(":", xIdx);
+          if (colonIdx != -1) {
+            int endIdx = payload.length();
+            int commaIdx = payload.indexOf(",", colonIdx);
+            int braceIdx = payload.indexOf("}", colonIdx);
+            if (commaIdx != -1 && commaIdx < endIdx) endIdx = commaIdx;
+            if (braceIdx != -1 && braceIdx < endIdx) endIdx = braceIdx;
+
+            // 순수한 데이터 알맹이만 컷 (예: " 0.5" 또는 " -0.5")
+            String xValue = payload.substring(colonIdx + 1, endIdx);
+            xValue.trim(); // 타임스탬프 침범 및 공백 차단
+            xValue.replace("\"", "");
+
+            if (xValue.indexOf("-") != -1) {
+              command = 's'; // 후진
+            } 
+            else if (xValue != "0.0" && xValue != "0" && xValue != "0.") {
+              command = 'w'; // 전진
+            }
+          }
+        }
+      }
+
+      // 확정된 한 글자 명령어를 루프로 토스
+      nextCmd = command;
+      hasNewCmd = true; 
+    }
+  }
+}
+
+void subscribeToTopic() {
+  String subMessage = "{\"op\":\"subscribe\",\"topic\":\"/" + robot_name + "/cmd_vel\",\"type\":\"geometry_msgs/msg/Twist\"}";
+  if (client.available()) { client.send(subMessage); }
+}
+
+void onEventsCallback(WebsocketsEvent event, String data) {
+  if (event == WebsocketsEvent::ConnectionOpened) { subscribeToTopic(); }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, 16, 17); 
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+
+  client.onMessage(onMessageCallback);
+  client.onEvent(onEventsCallback);
+  client.connect(websockets_server_host, websockets_server_port, "/");
+}
+
+void loop() {
+  client.poll();
+
+  if (!client.available()) {
+    static unsigned long lastReconnectTime = 0;
+    if (millis() - lastReconnectTime > 5000) { 
+      client.connect(websockets_server_host, websockets_server_port, "/");
+      lastReconnectTime = millis();
+    }
+  }
+
+  // 명령어가 실제로 바뀔 때만 우노 보드로 전송
+  if (hasNewCmd) {
+    if (nextCmd != lastSentCmd) {
+      Serial2.print(nextCmd); 
+      lastSentCmd = nextCmd; 
+    }
+    hasNewCmd = false;     
+  }
+
+  // 상행선 피드백 처리
+  if (client.available() && Serial2.available() && bufferIndex < 255) {
+    char c = Serial2.read();
+    serialBuffer[bufferIndex++] = c;
+    lastSerialReadTime = millis();
+  }
+
+  if (bufferIndex > 0 && (millis() - lastSerialReadTime > 5 || bufferIndex >= 250)) {
+    if (client.available()) {
+      String rawStr = String(serialBuffer).substring(0, bufferIndex);
+      String jsonPacket = "{\"op\":\"publish\",\"topic\":\"/" + robot_name + "/feedback\",\"msg\":{\"data\":\"" + rawStr + "\"}}";
+      client.send(jsonPacket);
+    }
+    bufferIndex = 0; 
+  }
+}
